@@ -25,22 +25,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# 注册路由
-# app.include_router(auth_router)
-# app.include_router(health_router)
-# app.include_router(training_router)
-# app.include_router(detection_router)
-# app.include_router(chat_router)
-# app.include_router(dashboard_router)
-# app.include_router(camera_router)
-# app.include_router(knowledge_router)
+# 注册路由 - 只启用认证和健康检查用于测试
+from app.api.auth import router as auth_router
+from app.api.health import router as health_router
 
+app.include_router(auth_router)
+app.include_router(health_router)
+
+
+def start():
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=9999, reload=True)
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8888,
-        reload=True,
-    )
+    start()       
