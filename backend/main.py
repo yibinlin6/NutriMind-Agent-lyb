@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.config.settings import settings
 from app.api.knowledge import router as knowledge_router
+from app.api.chat import router as chat_router
 
 # 应用生命周期管理
 @asynccontextmanager
@@ -33,6 +34,7 @@ from app.api.health import router as health_router
 app.include_router(auth_router)
 app.include_router(health_router)
 app.include_router(knowledge_router)
+app.include_router(chat_router)
 
 
 def start():
@@ -40,4 +42,4 @@ def start():
     uvicorn.run("main:app", host="0.0.0.0", port=9999, reload=True)
 
 if __name__ == "__main__":
-    start()       
+    start()

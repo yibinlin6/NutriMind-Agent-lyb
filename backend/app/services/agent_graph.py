@@ -282,7 +282,11 @@ async def run_agent(
         return {"response": "未提供任何消息或检测结果。", "tool_calls": [], "analysis_result": None}
 
     # 配置（session_id 作为 thread_id 用于内存检查点）
-    config = {"configurable": {"thread_id": session_id}}
+    config = {
+        "configurable": {"thread_id": session_id},
+        # 防止模型持续重复调用工具而形成无限循环。
+        "recursion_limit": 12,
+    }
 
     # 构建初始状态
     initial_state: AgentState = {
@@ -321,9 +325,9 @@ async def run_agent(
         }
 
     except Exception as exc:
-        logger.error(f"Agent 执行失败: {exc}")
+        logger.exception("Agent 执行失败")
         return {
-            "response": f"抱歉，营养分析过程出现错误：{exc}。请稍后重试。",
+            "response": "抱歉，营养分析暂时不可用，请稍后重试。",
             "tool_calls": [],
             "analysis_result": None,
         }

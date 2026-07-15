@@ -68,6 +68,40 @@ class BoundingBox(BaseModel):
     bbox: List[float] = Field(..., description="边界框坐标 [x1, y1, x2, y2]")
 
 
+class ChatRequest(BaseModel):
+    """发送给营养智能体的消息。"""
+
+    message: str = Field(default="", max_length=4000, description="用户消息；有检测结果时可为空")
+    session_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9_-]+$",
+        description="会话 ID；不传时由服务端生成",
+    )
+    detections: List[BoundingBox] = Field(
+        default_factory=list,
+        max_length=100,
+        description="YOLO 返回的食物检测结果",
+    )
+
+
+class AgentToolCall(BaseModel):
+    """智能体执行过的工具调用。"""
+
+    name: str
+    args: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatResponse(BaseModel):
+    """营养智能体响应。"""
+
+    session_id: str
+    response: str
+    tool_calls: List[AgentToolCall] = Field(default_factory=list)
+    analysis_result: Optional[str] = None
+
+
 class DetectionResponse(BaseModel):
     """单图检测响应"""
     task_id: int = Field(..., description="任务数据库 ID")
