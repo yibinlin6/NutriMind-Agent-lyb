@@ -11,7 +11,9 @@
 - [1. 健康检查](#1-健康检查)
 - [2. 认证](#2-认证)
 - [3. 知识库](#3-知识库)
-- [4. 通用说明](#4-通用说明)
+- [4. 摄像头](#4-摄像头)
+- [5. 数据看板](#5-数据看板)
+- [6. 通用说明](#6-通用说明)
 
 ---
 
@@ -402,7 +404,105 @@ GET /api/knowledge/stats
 
 ---
 
-## 4. 通用说明
+## 5. 数据看板
+
+> 所有接口需要认证：`Authorization: Bearer {access_token}`
+
+### 5.1 总览
+
+```http
+GET /api/dashboard/overview
+```
+
+**成功响应 `200`：**
+
+```json
+{
+  "code": 200,
+  "data": {
+    "total_users": 19,
+    "active_users": 19,
+    "total_detection_scenes": 0,
+    "total_detection_tasks": 0,
+    "total_training_tasks": 0,
+    "total_food_items": 0
+  }
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| `total_users` | 用户总数 |
+| `active_users` | 活跃用户数 |
+| `total_detection_scenes` | 检测场景数 |
+| `total_detection_tasks` | 检测任务总数 |
+| `total_training_tasks` | 训练任务总数 |
+| `total_food_items` | 食物营养条目数 |
+
+### 5.2 检测统计
+
+```http
+GET /api/dashboard/detection
+```
+
+| 字段 | 说明 |
+|------|------|
+| `total` | 检测任务总数 |
+| `completed` / `failed` / `pending` / `processing` | 各状态任务数 |
+| `total_objects_detected` | 累计检测目标数 |
+| `avg_inference_time` | 平均推理耗时（秒） |
+
+### 5.3 训练统计
+
+```http
+GET /api/dashboard/training
+```
+
+| 字段 | 说明 |
+|------|------|
+| `total` | 训练任务总数 |
+| `completed` / `failed` / `running` / `pending` / `paused` | 各状态任务数 |
+
+### 5.4 用户统计
+
+```http
+GET /api/dashboard/users
+```
+
+| 字段 | 说明 |
+|------|------|
+| `total` | 用户总数 |
+| `active` | 活跃用户数 |
+| `superusers` | 管理员数 |
+| `new_today` | 今日新增 |
+
+### 5.5 完整看板
+
+```http
+GET /api/dashboard/stats
+```
+
+聚合以上所有数据，返回 `overview + detection + training + users`。
+
+### 5.6 检测状态分布
+
+```http
+GET /api/dashboard/detection/status-distribution
+```
+
+返回各状态 `[{status, count}, ...]`。
+
+### 5.7 训练状态分布
+
+```http
+GET /api/dashboard/training/status-distribution
+```
+
+返回各状态 `[{status, count}, ...]`。
+
+---
+
+## 6. 通用说明
 
 ### 认证方式
 
@@ -541,4 +641,3 @@ DELETE /api/camera/{image_id}
 | 目标检测 | `detection.py` / `detection_service.py` | ⏳ 待接线 |
 | 模型训练 | `training.py` / `training_service.py` | ⏳ 待接线 |
 | 智能对话 | `chat.py` / `agent_graph.py` | ⏳ 待接线 |
-| 数据看板 | `dashboard.py` | ⏳ 待接线 |
