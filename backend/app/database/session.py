@@ -34,35 +34,8 @@ def get_session_local():
 
 # 依赖注入函数
 def get_db():
-    """获取数据库会话"""
+    """获取数据库会话（每个请求一个会话，用完自动关闭）"""
     SessionLocal = get_session_local()
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-# 创建数据库引擎
-engine = create_engine(
-    settings.DATABASE_URL,
-    pool_size=10,
-    max_overflow=20,
-    pool_pre_ping=True,
-    echo=settings.DEBUG,
-)
-
-# 会话工厂
-SessionLocal = sessionmaker(bind=engine)
-
-# ORM 基类
-Base = declarative_base()
-
-# 依赖注入函数
-
-
-def get_db():
-    """获取数据库会话"""
     db = SessionLocal()
     try:
         yield db
