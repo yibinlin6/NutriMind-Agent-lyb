@@ -2,12 +2,14 @@
 
 from pathlib import Path
 
-from pydantic import computed_field
+from pydantic import computed_field, ConfigDict
 from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
     """全局配置类。"""
+
+    model_config = ConfigDict(env_file=".env", env_file_encoding="utf-8")
 
     # 应用基础配置
     APP_NAME: str = "XJTU-VisAgent"
@@ -50,12 +52,9 @@ class Settings(BaseSettings):
 
     # 路径配置
     BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
-    MODELS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "data" / "models"
+    MODELS_DIR: Path = Path(__file__).resolve(
+    ).parent.parent.parent / "data" / "models"
     LOGS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "logs"
-
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
 
     @computed_field
     @property
