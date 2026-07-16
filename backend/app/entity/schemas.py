@@ -83,7 +83,8 @@ class BoundingBox(BaseModel):
 class ChatRequest(BaseModel):
     """发送给营养智能体的消息。"""
 
-    message: str = Field(default="", max_length=4000, description="用户消息；有检测结果时可为空")
+    message: str = Field(default="", max_length=4000,
+                         description="用户消息；有检测结果时可为空")
     session_id: Optional[str] = Field(
         default=None,
         min_length=1,
@@ -270,6 +271,70 @@ class PaginationParams(BaseModel):
     """分页参数"""
     page: int = Field(default=1, ge=1, description="页码")
     page_size: int = Field(default=20, ge=1, le=100, description="每页大小")
+
+
+# ============================================================
+# 用户管理相关 Schema（Dashboard 管理端）
+# ============================================================
+
+class UserListItem(BaseModel):
+    """用户列表项"""
+    id: int
+    username: str
+    email: str
+    phone: Optional[str] = None
+    avatar: Optional[str] = None
+    is_active: bool
+    is_superuser: bool
+    roles: List[str] = []
+    last_login_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class UserListResponse(BaseModel):
+    """用户列表分页响应"""
+    items: List[UserListItem]
+    total: int
+    page: int
+    page_size: int
+
+
+class UserDetailResponse(BaseModel):
+    """用户详情响应"""
+    id: int
+    username: str
+    email: str
+    phone: Optional[str] = None
+    avatar: Optional[str] = None
+    is_active: bool
+    is_superuser: bool
+    roles: List[str] = []
+    last_login_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    # 扩展统计
+    total_detection_tasks: int = 0
+    total_training_tasks: int = 0
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ToggleUserStatusRequest(BaseModel):
+    """启用/禁用用户请求"""
+    is_active: bool = Field(..., description="是否启用")
+
+
+class UpdateUserRoleRequest(BaseModel):
+    """修改用户角色请求"""
+    role_names: List[str] = Field(..., description="角色名称列表")
+
+
+class UpdateUserSuperuserRequest(BaseModel):
+    """修改用户管理员状态请求"""
+    is_superuser: bool = Field(..., description="是否超级管理员")
 
 
 # ============================================================

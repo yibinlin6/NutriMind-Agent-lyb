@@ -1,11 +1,11 @@
 """
 Dashboard 看板路由
-提供系统总览、检测统计、训练统计、用户统计等聚合数据接口
+提供系统总览、检测统计、训练统计、用户统计及用户管理等接口
 """
 from datetime import datetime, timedelta, timezone
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -26,8 +26,14 @@ from app.entity.schemas import (
     DetectionStats,
     TaskStatusCount,
     TrainingStats,
+    ToggleUserStatusRequest,
+    UpdateUserSuperuserRequest,
+    UpdateUserRoleRequest,
+    UserDetailResponse,
+    UserListResponse,
     UserStats,
 )
+from app.services.user_service import user_service
 
 logger = get_logger("dashboard")
 
@@ -167,6 +173,135 @@ async def get_user_stats(
     )
 
     return ApiResponse(code=200, message="success", data=stats.model_dump())
+
+
+# ===========================================================================
+# 用户管理接口
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# GET /api/dashboard/users/list  — 用户列表（分页 + 搜索）
+# ---------------------------------------------------------------------------
+@router.get("/users/list", response_model=ApiResponse)
+async def list_users(
+    page: int = Query(default=1, ge=1, description="页码"),
+    page_size: int = Query(default=20, ge=1, le=100, description="每页大小"),
+    search: Optional[str] = Query(
+        default=None, description="搜索关键词（用户名/邮箱/手机）"),
+    is_active: Optional[bool] = Query(default=None, description="启用状态过滤"),
+    is_superuser: Optional[bool] = Query(default=None, description="管理员状态过滤"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """获取用户分页列表，支持关键词搜索和状态过滤"""
+    logger.info(f"管理员 {current_user.username} 查询用户列表 page={page}")
+    result = user_service.list_users(
+        db,
+        page=page,
+        page_size=page_size,
+        search=search,
+        is_active=is_active,
+        is_superuser=is_superuser,
+    )
+    return ApiResponse(
+        code=200,
+        message="success",
+        data=UserListResponse(**result).model_dump(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/dashboard/users/{user_id}  — 用户详情
+# ---------------------------------------------------------------------------
+@router.get("/users/{user_id}", response_model=ApiResponse)
+async def get_user_detail(
+    user_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """获取指定用户的详细信息（含检测/训练任务统计）"""
+    logger.info(f"管理员 {current_user.username} 查询用户详情 id={user_id}")
+    detail = user_service.get_user_detail(db, user_id)
+    return ApiResponse(
+        code=200,
+        message="success",
+        data=UserDetailResponse(**detail).model_dump(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/dashboard/users/{user_id}/status  — 启用/禁用用户
+# ---------------------------------------------------------------------------
+@router.put("/users/{user_id}/status", response_model=ApiResponse)
+async def toggle_user_status(
+    user_id: int,
+    body: ToggleUserStatusRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """启用或禁用指定用户"""
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="不能修改自己的状态")
+
+    logger.info(
+        f"管理员 {current_user.username} 修改用户 {user_id} 状态 -> {'启用' if body.is_active else '禁用'}"
+    )
+    user = user_service.toggle_user_status(db, user_id, body.is_active)
+    return ApiResponse(
+        code=200,
+        message="success",
+        data={"id": user.id, "username": user.username,
+              "is_active": user.is_active},
+    )
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/dashboard/users/{user_id}/roles  — 修改用户角色
+# ---------------------------------------------------------------------------
+@router.put("/users/{user_id}/roles", response_model=ApiResponse)
+async def update_user_roles(
+    user_id: int,
+    body: UpdateUserRoleRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """修改指定用户的角色（全量替换）"""
+    logger.info(
+        f"管理员 {current_user.username} 修改用户 {user_id} 角色 -> {body.role_names}"
+    )
+    new_roles = user_service.update_user_roles(db, user_id, body.role_names)
+    return ApiResponse(
+        code=200,
+        message="success",
+        data={"id": user_id, "roles": new_roles},
+    )
+
+
+# ---------------------------------------------------------------------------
+# PUT /api/dashboard/users/{user_id}/superuser  — 修改管理员状态
+# ---------------------------------------------------------------------------
+@router.put("/users/{user_id}/superuser", response_model=ApiResponse)
+async def update_superuser_status(
+    user_id: int,
+    body: UpdateUserSuperuserRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """修改指定用户的管理员状态"""
+    if user_id == current_user.id:
+        raise HTTPException(status_code=400, detail="不能修改自己的管理员状态")
+
+    logger.info(
+        f"管理员 {current_user.username} 修改用户 {user_id} 管理员状态 -> {body.is_superuser}"
+    )
+    user = user_service.update_superuser_status(db, user_id, body.is_superuser)
+    return ApiResponse(
+        code=200,
+        message="success",
+        data={"id": user.id, "username": user.username,
+              "is_superuser": user.is_superuser},
+    )
 
 
 # ---------------------------------------------------------------------------
