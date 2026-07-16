@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import JSONResponse
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 from app.core.security import get_current_user
+from app.config.settings import settings
 from app.database.session import get_db
 from app.entity.schemas import UserLogin, UserRegister, UserResponse, TokenResponse
 from app.services.user_service import user_service
@@ -59,19 +61,25 @@ async def login(request: UserLogin, db: Session = Depends(get_db)):
             "id": user.id,
             "username": user.username,
             "email": user.email,
+            "phone": user.phone,
             "avatar": user.avatar,
+            "is_active": user.is_active,
+            "is_superuser": user.is_superuser,
             "roles": roles,
+            "last_login_at": user.last_login_at,
+            "created_at": user.created_at,
         },
     }
 
-    response = JSONResponse(content=response_data)
+    response = JSONResponse(content=jsonable_encoder(response_data))
     response.set_cookie(
-        key="access_token",
+        key=settings.AUTH_COOKIE_NAME,
         value=access_token,
         httponly=True,
-        secure=False,
-        samesite="lax",
-        max_age=30 * 60,
+        secure=settings.AUTH_COOKIE_SECURE,
+        samesite=settings.AUTH_COOKIE_SAMESITE,
+        domain=settings.AUTH_COOKIE_DOMAIN,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         path="/",
     )
     return response
@@ -100,7 +108,14 @@ async def get_current_user_info(
 
 @router.post("/logout")
 async def logout():
-    """登出 - 清除 HttpOnly cookie"""
+    """幂等登出：无论登录状态如何都清除 HttpOnly Cookie。"""
     response = JSONResponse(content={"message": "已登出"})
-    response.delete_cookie(key="access_token", path="/")
+    response.delete_cookie(
+        key=settings.AUTH_COOKIE_NAME,
+        path="/",
+        domain=settings.AUTH_COOKIE_DOMAIN,
+        secure=settings.AUTH_COOKIE_SECURE,
+        httponly=True,
+        samesite=settings.AUTH_COOKIE_SAMESITE,
+    )
     return response

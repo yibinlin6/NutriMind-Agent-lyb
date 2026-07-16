@@ -23,7 +23,7 @@ class KnowledgeService:
             return
 
         try:
-            from langchain.text_splitter import RecursiveCharacterTextSplitter
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
             from langchain_openai import OpenAIEmbeddings
             from langchain_community.vectorstores import PGVector
 
@@ -53,7 +53,7 @@ class KnowledgeService:
     def _init_vector_store(self):
         """初始化 PgVector"""
         from langchain_community.vectorstores import PGVector
-        connection_string = settings.database_url
+        connection_string = settings.DATABASE_URL
         self.vector_store = PGVector(
             connection_string=connection_string,
             embedding_function=self.embeddings,
@@ -152,7 +152,7 @@ class KnowledgeService:
         try:
             # 使用 SQLAlchemy 直接操作表
             from sqlalchemy import create_engine, text
-            engine = create_engine(settings.database_url)
+            engine = create_engine(settings.DATABASE_URL)
             with engine.connect() as conn:
                 sql = text(
                     "DELETE FROM langchain_pg_embedding "
@@ -172,7 +172,7 @@ class KnowledgeService:
         self._initialize()
         try:
             from sqlalchemy import create_engine, text
-            engine = create_engine(settings.database_url)
+            engine = create_engine(settings.DATABASE_URL)
             with engine.connect() as conn:
                 # 总块数
                 count_sql = text("SELECT COUNT(*) FROM langchain_pg_embedding")

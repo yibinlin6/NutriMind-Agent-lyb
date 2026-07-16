@@ -2,7 +2,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 import bcrypt
 from jose import JWTError, jwt
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from app.config.settings import settings
@@ -35,17 +35,15 @@ def create_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
     return encoded_jwt
 
 async def get_current_user(
+    request: Request,
     token: Optional[str] = Depends(oauth2_scheme),
     db: Session = Depends(get_db)
 ):
-    """获取当前⽤户（⽀持 Header 和 Cookie 双通道）"""
+    """获取当前用户：Bearer Header 优先，缺失时读取 HttpOnly Cookie。"""
     from app.entity.db_models import User
 
-    # 如果 Header 中没有 Token，尝试从 Cookie 获取
     if not token:
-        # 注意：这⾥需要通过其他⽅式获取 request
-        # 实际实现中使⽤ middleware 或 context
-        pass
+        token = request.cookies.get(settings.AUTH_COOKIE_NAME)
 
     if not token:
         raise HTTPException(

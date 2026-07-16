@@ -15,10 +15,135 @@ Agent 工具函数模块 — 为 LLM Agent 提供可调用的 Python 工具。
 import asyncio
 import json
 import logging
+from sqlalchemy.exc import SQLAlchemyError
+from app.config.settings import settings
 from app.database.session import SessionLocal
 from app.entity.db_models import DetectionTask, FoodNutrition, User
+from app.services.image_store import image_store
 
 logger = logging.getLogger(__name__)
+_yolo_model = None
+
+# 模型联调阶段的内置演示数据。数据库可用时优先使用数据库；数据库未初始化时，
+# 常见食物仍可完成 YOLO JSON → 营养计算 → Agent 建议的端到端验证。
+BUILTIN_NUTRITION = {
+    "apple": {"cn": "苹果", "calories": 52, "protein": 0.3, "fat": 0.2, "carbs": 13.8, "fiber": 2.4, "category": "fruit"},
+    "banana": {"cn": "香蕉", "calories": 89, "protein": 1.1, "fat": 0.3, "carbs": 22.8, "fiber": 2.6, "category": "fruit"},
+    "rice": {"cn": "米饭", "calories": 116, "protein": 2.6, "fat": 0.3, "carbs": 25.9, "fiber": 0.3, "category": "staple"},
+    "chicken": {"cn": "鸡肉", "calories": 165, "protein": 31.0, "fat": 3.6, "carbs": 0.0, "fiber": 0.0, "category": "meat"},
+    "beef": {"cn": "牛肉", "calories": 250, "protein": 26.0, "fat": 15.0, "carbs": 0.0, "fiber": 0.0, "category": "meat"},
+    "egg": {"cn": "鸡蛋", "calories": 143, "protein": 12.6, "fat": 9.5, "carbs": 0.7, "fiber": 0.0, "category": "protein"},
+    "broccoli": {"cn": "西兰花", "calories": 34, "protein": 2.8, "fat": 0.4, "carbs": 6.6, "fiber": 2.6, "category": "vegetable"},
+    "tomato": {"cn": "番茄", "calories": 18, "protein": 0.9, "fat": 0.2, "carbs": 3.9, "fiber": 1.2, "category": "vegetable"},
+}
+
+
+def _builtin_food(food_name: str):
+    normalized = food_name.strip().lower()
+    if normalized in BUILTIN_NUTRITION:
+        return normalized, BUILTIN_NUTRITION[normalized]
+    for name, data in BUILTIN_NUTRITION.items():
+        if food_name.strip() == data["cn"]:
+            return name, data
+    return None
+
+
+def _food_values(food) -> dict:
+    if isinstance(food, tuple):
+        name, data = food
+        return {"name": name, **data, "source": "系统内置演示数据"}
+    return {
+        "name": food.food_name,
+        "cn": food.food_name_cn,
+        "calories": food.calories_per_100g,
+        "protein": food.protein_per_100g,
+        "fat": food.fat_per_100g,
+        "carbs": food.carbs_per_100g,
+        "fiber": food.fiber_per_100g,
+        "category": food.category or "未分类",
+        "source": food.source or "数据库",
+    }
+
+
+# ==================================================================
+# 工具 0：YOLO 食物检测（Agent 的视觉工具）
+# ==================================================================
+
+async def detect_food(image_id: str, conf_threshold: float = 0.25) -> str:
+    """根据 image_id 调用 YOLO 食物检测，并返回标准 detections JSON。
+
+    联调阶段如果图片附带 mock_detections，则返回模拟 YOLO 结果；正式阶段
+    使用 ``data/models/{DEFAULT_DETECTION_MODEL}`` 执行真实推理。工具始终返回
+    JSON 字符串，让 Agent 能观察结果并继续调用营养工具。
+    """
+    try:
+        image_path = image_store.get_path(image_id)
+        mock_detections = image_store.get_mock_detections(image_id)
+        if mock_detections is not None:
+            return json.dumps(
+                {
+                    "success": True,
+                    "mode": "mock",
+                    "image_id": image_id,
+                    "detections": mock_detections,
+                    "total_objects": len(mock_detections),
+                },
+                ensure_ascii=False,
+            )
+
+        if settings.DETECTION_MODE != "yolo":
+            return json.dumps(
+                {
+                    "success": False,
+                    "mode": settings.DETECTION_MODE,
+                    "error": "当前图片没有模拟检测结果，且真实 YOLO 模式尚未启用",
+                },
+                ensure_ascii=False,
+            )
+
+        model_path = settings.MODELS_DIR / settings.DEFAULT_DETECTION_MODEL
+        if not model_path.exists():
+            return json.dumps(
+                {"success": False, "mode": "yolo", "error": f"模型文件不存在: {model_path}"},
+                ensure_ascii=False,
+            )
+
+        def _predict() -> list[dict]:
+            global _yolo_model
+            from ultralytics import YOLO
+
+            if _yolo_model is None:
+                _yolo_model = YOLO(str(model_path))
+            results = _yolo_model.predict(source=str(image_path), conf=conf_threshold, verbose=False)
+            detections = []
+            result = results[0]
+            if result.boxes is not None:
+                for box in result.boxes:
+                    class_id = int(box.cls[0])
+                    detections.append(
+                        {
+                            "class_name": result.names.get(class_id, str(class_id)),
+                            "class_name_cn": None,
+                            "confidence": round(float(box.conf[0]), 4),
+                            "bbox": [round(value, 2) for value in box.xyxy[0].tolist()],
+                        }
+                    )
+            return detections
+
+        detections = await asyncio.to_thread(_predict)
+        return json.dumps(
+            {
+                "success": True,
+                "mode": "yolo",
+                "image_id": image_id,
+                "detections": detections,
+                "total_objects": len(detections),
+            },
+            ensure_ascii=False,
+        )
+    except Exception as exc:
+        logger.exception("食物检测工具执行失败")
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
 
 # ==================================================================
@@ -61,26 +186,33 @@ async def query_food_calories(food_name: str) -> str:
                     .first()
                 )
 
-            if food is None:
-                return (
-                    f"未在数据库中找到「{food_name}」的营养数据。"
-                    f"请尝试使用更通用的食物名称（如'米饭'而非'蛋炒饭'），"
-                    f"或手动输入该食物的营养信息。"
-                )
-
-            return (
-                f"【{food.food_name_cn} ({food.food_name})】\n"
-                f"每 100{food.serving_unit} 营养成分：\n"
-                f"  - 热量: {food.calories_per_100g:.1f} kcal\n"
-                f"  - 蛋白质: {food.protein_per_100g:.1f} g\n"
-                f"  - 脂肪: {food.fat_per_100g:.1f} g\n"
-                f"  - 碳水化合物: {food.carbs_per_100g:.1f} g\n"
-                f"  - 膳食纤维: {food.fiber_per_100g:.1f} g\n"
-                f"食物分类: {food.category or '未分类'}\n"
-                f"数据来源: {food.source or '系统内置'}"
-            )
+        except SQLAlchemyError as exc:
+            logger.warning("营养数据库不可用，使用内置演示数据: %s", exc)
+            food = None
         finally:
             db.close()
+
+        if food is None:
+            food = _builtin_food(food_name)
+        if food is None:
+            return (
+                f"未在数据库中找到「{food_name}」的营养数据。"
+                f"请尝试使用更通用的食物名称（如'米饭'而非'蛋炒饭'），"
+                f"或手动输入该食物的营养信息。"
+            )
+
+        values = _food_values(food)
+        return (
+            f"【{values['cn']} ({values['name']})】\n"
+            f"每 100g 营养成分：\n"
+            f"  - 热量: {values['calories']:.1f} kcal\n"
+            f"  - 蛋白质: {values['protein']:.1f} g\n"
+            f"  - 脂肪: {values['fat']:.1f} g\n"
+            f"  - 碳水化合物: {values['carbs']:.1f} g\n"
+            f"  - 膳食纤维: {values['fiber']:.1f} g\n"
+            f"食物分类: {values['category']}\n"
+            f"数据来源: {values['source']}"
+        )
 
     return await asyncio.to_thread(_query_sync, food_name)
 
@@ -158,6 +290,7 @@ async def calculate_total_nutrition(food_items_json: str) -> str:
             return "食物清单为空，无法计算。"
 
         db = SessionLocal()
+        database_available = True
         try:
             total_calories = 0.0
             total_protein = 0.0
@@ -173,22 +306,32 @@ async def calculate_total_nutrition(food_items_json: str) -> str:
                 food_name = item.get("food_name", "")
                 weight_g = float(item.get("estimated_weight_g", 100))
 
-                food = (
-                    db.query(FoodNutrition)
-                    .filter(
-                        (FoodNutrition.food_name == food_name.lower())
-                        | (FoodNutrition.food_name_cn == food_name)
-                    )
-                    .first()
-                )
+                food = None
+                if database_available:
+                    try:
+                        food = (
+                            db.query(FoodNutrition)
+                            .filter(
+                                (FoodNutrition.food_name == food_name.lower())
+                                | (FoodNutrition.food_name_cn == food_name)
+                            )
+                            .first()
+                        )
+                    except SQLAlchemyError as exc:
+                        logger.warning("营养数据库不可用，使用内置演示数据: %s", exc)
+                        db.rollback()
+                        database_available = False
+                if food is None:
+                    food = _builtin_food(food_name)
 
                 if food:
+                    values = _food_values(food)
                     factor = weight_g / 100.0
-                    cal = food.calories_per_100g * factor
-                    prot = food.protein_per_100g * factor
-                    fat = food.fat_per_100g * factor
-                    carb = food.carbs_per_100g * factor
-                    fib = food.fiber_per_100g * factor
+                    cal = values["calories"] * factor
+                    prot = values["protein"] * factor
+                    fat = values["fat"] * factor
+                    carb = values["carbs"] * factor
+                    fib = values["fiber"] * factor
 
                     total_calories += cal
                     total_protein += prot
@@ -198,7 +341,7 @@ async def calculate_total_nutrition(food_items_json: str) -> str:
                     found_count += 1
 
                     lines.append(
-                        f"- {food.food_name_cn} ({weight_g}g): "
+                        f"- {values['cn']} ({weight_g}g): "
                         f"{cal:.0f} kcal | "
                         f"蛋白质 {prot:.1f}g | "
                         f"脂肪 {fat:.1f}g | "

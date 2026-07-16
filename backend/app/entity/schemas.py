@@ -102,6 +102,14 @@ class ChatResponse(BaseModel):
     analysis_result: Optional[str] = None
 
 
+class ImageChatResponse(ChatResponse):
+    """图片营养分析响应。"""
+
+    image_id: str
+    detection_mode: str
+    detections: List[BoundingBox] = Field(default_factory=list)
+
+
 class DetectionResponse(BaseModel):
     """单图检测响应"""
     task_id: int = Field(..., description="任务数据库 ID")

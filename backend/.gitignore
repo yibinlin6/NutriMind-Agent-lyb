@@ -19,6 +19,10 @@ venv/
 # Logs
 logs/*.log
 
+# Runtime images and model weights
+data/agent_uploads/
+data/models/*.pt
+
 # Environment
 .env
 
