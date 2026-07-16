@@ -13,15 +13,19 @@ Agent 工具函数模块 — 为 LLM Agent 提供可调用的 Python 工具。
 """
 
 import asyncio
+import base64
 import json
 import logging
+from pathlib import Path
 from sqlalchemy.exc import SQLAlchemyError
+from app.config.settings import settings
 from app.database.session import get_session_local
 from app.entity.db_models import DetectionTask, FoodNutrition, User
 from app.services.image_store import image_store
 
 logger = logging.getLogger(__name__)
 _yolo_model = None
+_vision_llm = None
 
 
 def SessionLocal():
@@ -73,12 +77,13 @@ def _food_values(food) -> dict:
 # 工具 0：YOLO 食物检测（Agent 的视觉工具）
 # ==================================================================
 
-async def detect_food(image_id: str, conf_threshold: float = 0.25) -> str:
+async def detect_food(image_id: str, conf_threshold: float = 0.1) -> str:
     """根据 image_id 调用 YOLO 食物检测，并返回标准 detections JSON。
 
-    联调阶段如果图片附带 mock_detections，则返回模拟 YOLO 结果；正式阶段
-    使用 ``data/models/{DEFAULT_DETECTION_MODEL}`` 执行真实推理。工具始终返回
-    JSON 字符串，让 Agent 能观察结果并继续调用营养工具。
+    识别阈值默认 0.1（低阈值，避免漏检）。confidence < 0.25 的检测结果会标记
+    low_confidence=True，Agent 可据此决定是否调用 vision_verify_food 二次确认。
+
+    如果 YOLO 模式未启用或模型不存在，返回 error 提示 Agent 使用视觉兜底。
     """
     try:
         image_path = image_store.get_path(image_id)
@@ -100,7 +105,8 @@ async def detect_food(image_id: str, conf_threshold: float = 0.25) -> str:
                 {
                     "success": False,
                     "mode": settings.DETECTION_MODE,
-                    "error": "当前图片没有模拟检测结果，且真实 YOLO 模式尚未启用",
+                    "error": "YOLO 模式未启用",
+                    "hint": "请调用 vision_verify_food(image_id) 进行视觉识别兜底",
                 },
                 ensure_ascii=False,
             )
@@ -108,7 +114,11 @@ async def detect_food(image_id: str, conf_threshold: float = 0.25) -> str:
         model_path = settings.MODELS_DIR / settings.DEFAULT_DETECTION_MODEL
         if not model_path.exists():
             return json.dumps(
-                {"success": False, "mode": "yolo", "error": f"模型文件不存在: {model_path}"},
+                {
+                    "success": False, "mode": "yolo",
+                    "error": f"模型文件不存在: {model_path}",
+                    "hint": "请调用 vision_verify_food(image_id) 进行视觉识别兜底",
+                },
                 ensure_ascii=False,
             )
 
@@ -124,17 +134,20 @@ async def detect_food(image_id: str, conf_threshold: float = 0.25) -> str:
             if result.boxes is not None:
                 for box in result.boxes:
                     class_id = int(box.cls[0])
+                    conf = round(float(box.conf[0]), 4)
                     detections.append(
                         {
                             "class_name": result.names.get(class_id, str(class_id)),
                             "class_name_cn": None,
-                            "confidence": round(float(box.conf[0]), 4),
+                            "confidence": conf,
                             "bbox": [round(value, 2) for value in box.xyxy[0].tolist()],
+                            "low_confidence": conf < 0.25,
                         }
                     )
             return detections
 
         detections = await asyncio.to_thread(_predict)
+        low_conf_count = sum(1 for d in detections if d.get("low_confidence"))
         return json.dumps(
             {
                 "success": True,
@@ -142,6 +155,11 @@ async def detect_food(image_id: str, conf_threshold: float = 0.25) -> str:
                 "image_id": image_id,
                 "detections": detections,
                 "total_objects": len(detections),
+                "low_confidence_count": low_conf_count,
+                "hint": (
+                    f"有 {low_conf_count} 个低置信度结果(confidence<0.25)，"
+                    "可调用 vision_verify_food(image_id) 进行视觉兜底验证"
+                ) if low_conf_count > 0 else None,
             },
             ensure_ascii=False,
         )
@@ -151,7 +169,120 @@ async def detect_food(image_id: str, conf_threshold: float = 0.25) -> str:
 
 
 # ==================================================================
-# 工具 1：单食物营养查询
+# 工具 1：视觉识别兜底（LLM Vision Fallback）
+# ==================================================================
+
+async def vision_verify_food(image_id: str) -> str:
+    """当 YOLO 模型不存在、检测失败或结果低置信度时，用多模态 LLM
+    直接观察图片进行食物识别兜底。
+
+    对 image_id 对应的图片调用视觉语言模型（Qwen2.5-VL），
+    返回识别到的食物列表和简要描述。适合处理 YOLO 不认识的食物类别。
+
+    Args:
+        image_id: 图片唯一标识（由系统上传时生成）
+
+    Returns:
+        JSON: {"success": bool, "foods": [{"name": "...", "confidence": "high/medium/low"}], ...}
+    """
+    try:
+        image_path = image_store.get_path(image_id)
+        if not image_path or not Path(image_path).exists():
+            return json.dumps(
+                {"success": False, "error": f"图片不存在: {image_id}"},
+                ensure_ascii=False,
+            )
+
+        # 读取图片并转 base64
+        with open(image_path, "rb") as f:
+            img_data = base64.standard_b64encode(f.read()).decode("utf-8")
+
+        # 判断图片类型
+        suffix = Path(image_path).suffix.lower()
+        mime = {"jpg": "jpeg", "jpeg": "jpeg", "png": "png", "webp": "webp"}
+        media_type = f"image/{mime.get(suffix.lstrip('.'), 'jpeg')}"
+
+        # 调用视觉 LLM
+        def _vision_call() -> dict:
+            global _vision_llm
+            from langchain_openai import ChatOpenAI
+
+            if _vision_llm is None:
+                _vision_llm = ChatOpenAI(
+                    model=settings.VISION_MODEL,
+                    openai_api_key=settings.OPENAI_API_KEY,
+                    openai_api_base=settings.OPENAI_BASE_URL,
+                    temperature=0.1,
+                    max_tokens=1024,
+                )
+
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:{media_type};base64,{img_data}",
+                                "detail": "auto",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": (
+                                "你是一个食物识别助手。请仔细观察这张图片，识别图中所有的食物。\n\n"
+                                "要求：\n"
+                                "1. 列出你能识别的每一种食物（中英文名称）\n"
+                                "2. 给出每种食物的置信度（high/medium/low）\n"
+                                "3. 如果看不清或不确定，标注为 'uncertain'\n"
+                                "4. 按 JSON 格式返回: {\"foods\": [{\"name\": \"...\", \"cn\": \"...\", \"confidence\": \"high/medium/low\"}]}\n\n"
+                                "请直接返回 JSON，不要其他文字。"
+                            ),
+                        },
+                    ],
+                }
+            ]
+
+            response = _vision_llm.invoke(messages)
+            return response.content
+
+        result = await asyncio.to_thread(_vision_call)
+
+        # 尝试解析 JSON
+        try:
+            parsed = json.loads(result)
+            return json.dumps(
+                {
+                    "success": True,
+                    "mode": "vision_fallback",
+                    "image_id": image_id,
+                    "foods": parsed.get("foods", []),
+                },
+                ensure_ascii=False,
+            )
+        except json.JSONDecodeError:
+            # LLM 没按 JSON 格式返回，直接当文本
+            return json.dumps(
+                {
+                    "success": True,
+                    "mode": "vision_fallback",
+                    "image_id": image_id,
+                    "foods": [],
+                    "raw_response": result,
+                },
+                ensure_ascii=False,
+            )
+
+    except Exception as exc:
+        logger.exception("视觉识别兜底失败")
+        return json.dumps(
+            {"success": False, "error": str(exc)},
+            ensure_ascii=False,
+        )
+
+
+# ==================================================================
+# 工具 2：单食物营养查询
 # ==================================================================
 
 async def query_food_calories(food_name: str) -> str:
@@ -222,7 +353,7 @@ async def query_food_calories(food_name: str) -> str:
 
 
 # ==================================================================
-# 工具 2：按类别查询食物
+# 工具 3：按类别查询食物
 # ==================================================================
 
 async def query_food_by_category(category: str) -> str:
@@ -271,7 +402,7 @@ async def query_food_by_category(category: str) -> str:
 
 
 # ==================================================================
-# 工具 3：计算总营养
+# 工具 4：计算总营养
 # ==================================================================
 
 async def calculate_total_nutrition(food_items_json: str) -> str:
@@ -386,7 +517,7 @@ async def calculate_total_nutrition(food_items_json: str) -> str:
 
 
 # ==================================================================
-# 工具 4：获取用户档案
+# 工具 5：获取用户档案
 # ==================================================================
 
 async def get_user_profile(user_id: int) -> str:
@@ -419,7 +550,7 @@ async def get_user_profile(user_id: int) -> str:
 
 
 # ==================================================================
-# 工具 5：保存检测记录
+# 工具 6：保存检测记录
 # ==================================================================
 
 async def save_detection_record(

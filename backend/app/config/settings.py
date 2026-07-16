@@ -67,8 +67,9 @@ class Settings(BaseSettings):
     LOGS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "logs"
     UPLOADS_DIR: Path = Path(__file__).resolve().parent.parent.parent / "data" / "agent_uploads"
     MAX_IMAGE_SIZE_MB: int = 10
-    DETECTION_MODE: str = "mock"
-    DEFAULT_DETECTION_MODEL: str = "best.pt"
+    DETECTION_MODE: str = "yolo"
+    DEFAULT_DETECTION_MODEL: str = "yolo11_food_best.pt"
+    VISION_MODEL: str = "Qwen/Qwen2.5-VL-32B-Instruct"
 
     @computed_field
     @property

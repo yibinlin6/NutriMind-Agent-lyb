@@ -78,6 +78,7 @@ class BoundingBox(BaseModel):
     class_name_cn: Optional[str] = Field(default=None, description="类别中文名")
     confidence: float = Field(..., ge=0.0, le=1.0, description="置信度")
     bbox: List[float] = Field(..., description="边界框坐标 [x1, y1, x2, y2]")
+    low_confidence: bool = Field(default=False, description="低置信度标记（<0.25），供 Agent 判断")
 
 
 class ChatRequest(BaseModel):

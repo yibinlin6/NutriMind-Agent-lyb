@@ -37,6 +37,7 @@ from app.services.agent_tools import (
     query_food_by_category,
     query_food_calories,
     save_detection_record,
+    vision_verify_food,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +94,12 @@ AGENT_TOOLS = [
     StructuredTool.from_function(
         coroutine=save_detection_record,
         name="save_detection_record",
-        description="将 YOLOv11 检测结果持久化保存到数据库。输入为 user_id(int), scene_id(int), detections_json(str)。",
+        description="将检测结果持久化保存到数据库。输入为 user_id(int), scene_id(int), detections_json(str)。",
+    ),
+    StructuredTool.from_function(
+        coroutine=vision_verify_food,
+        name="vision_verify_food",
+        description="视觉识别兜底。当 YOLO 检测失败、模型不存在、或检测结果低置信度时，调用多模态 LLM 直接观察图片识别食物。输入为 image_id。返回识别的食物列表 JSON。",
     ),
 ]
 
