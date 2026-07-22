@@ -201,7 +201,7 @@ class KnowledgeService:
             try:
                 full_text = "\n".join(doc.page_content for doc in documents)
                 foods_count = await self.extract_and_store_graph(
-                    full_text, source=Path(file_path).name
+                    full_text, source=Path(file_path).name, user_id=user_id
                 )
             except Exception as exc:
                 logger.warning("图谱实体抽取失败，不影响文档入库: %s", exc)
@@ -216,11 +216,12 @@ class KnowledgeService:
     # 单次回填处理的资料上限，避免一次请求意外产生过多模型调用
     _REBUILD_MAX_SOURCES = 24
 
-    async def extract_and_store_graph(self, text: str, source: str = "") -> int:
-        """从文档正文抽取食物营养实体，并写入 food_nutrition 图谱数据表。
+    async def extract_and_store_graph(self, text: str, source: str = "", user_id: int = 0) -> int:
+        """从文档正文抽取食物营养实体，并写入 food_nutrition 图谱数据表（按用户隔离）。
 
         返回新增/更新的食物条目数量。抽取由大模型完成，仅提取文中明确
-        提及、且带营养语境的食物，避免臆造数据。
+        提及、且带营养语境的食物，避免臆造数据。缺热量的食物也会入库，
+        标记为“待补全”（calories 为空），由 complete_incomplete_foods 定向补全。
         """
         import asyncio
 
@@ -229,7 +230,176 @@ class KnowledgeService:
         foods = await asyncio.to_thread(self._extract_food_entities, text[: self._EXTRACT_MAX_CHARS])
         if not foods:
             return 0
-        return await asyncio.to_thread(self._store_food_entities, foods, source)
+        return await asyncio.to_thread(self._store_food_entities, foods, source, user_id)
+
+    async def complete_incomplete_foods(self, user_id: int = 0) -> int:
+        """对当前用户「待补全」（缺热量）的食物定向联网补全每 100g 营养。
+
+        只处理已入库但缺热量的少数条目，成本可控；补全成功后写回数据库，
+        这些食物随即出现在图谱、可被 Agent 查询。返回成功补全的条目数。
+        """
+        if not settings.KNOWLEDGE_GRAPH_WEB_COMPLETE:
+            return 0
+        import asyncio
+
+        incomplete = await asyncio.to_thread(
+            self._load_incomplete_foods, user_id, settings.KNOWLEDGE_GRAPH_WEB_COMPLETE_MAX,
+        )
+        completed = 0
+        for food_id, name_cn, name_en in incomplete:
+            name = (name_cn or name_en or "").strip()
+            if not name:
+                continue
+            try:
+                web_results = await web_search_service.search(f"{name} 每100克 营养成分 热量", limit=3)
+                if not web_results:
+                    continue
+                filled = await self._extract_food_from_web(name, web_results)
+                if filled and self._num_or_none(filled.get("calories")) is not None:
+                    applied = await asyncio.to_thread(self._apply_food_completion, food_id, filled)
+                    if applied:
+                        completed += 1
+                        logger.info("联网补全食物营养成功：%s（id=%s）", name, food_id)
+            except Exception as exc:
+                logger.warning("联网补全食物营养失败（%s）: %s", name, exc)
+        logger.info("待补全食物处理完成：user_id=%s，成功补全 %d 条", user_id, completed)
+        return completed
+
+    @staticmethod
+    def _num_or_none(value):
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return None
+        return num if num >= 0 else None
+
+    @staticmethod
+    def _load_incomplete_foods(user_id: int, limit: int) -> List[Tuple[int, str, str]]:
+        """读出当前用户缺热量的待补全食物（id, 中文名, 英文名）。"""
+        from sqlalchemy import create_engine, text as sql_text
+
+        owner = user_id or None
+        engine = create_engine(settings.DATABASE_URL)
+        clause = "user_id = :uid" if owner is not None else "user_id IS NULL"
+        query = sql_text(
+            "SELECT id, food_name_cn, food_name FROM food_nutrition "
+            f"WHERE {clause} AND calories_per_100g IS NULL ORDER BY id LIMIT :lim"
+        )
+        params = {"lim": limit}
+        if owner is not None:
+            params["uid"] = owner
+        with engine.connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [(r[0], r[1], r[2]) for r in rows]
+
+    @staticmethod
+    def _apply_food_completion(food_id: int, filled: Dict[str, Any]) -> bool:
+        """把联网补全到的营养写回指定食物条目。"""
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from app.entity.db_models import FoodNutrition
+
+        def _num(value):
+            try:
+                num = float(value)
+            except (TypeError, ValueError):
+                return None
+            return num if num >= 0 else None
+
+        calories = _num(filled.get("calories"))
+        if calories is None:
+            return False
+        engine = create_engine(settings.DATABASE_URL)
+        db = sessionmaker(bind=engine)()
+        try:
+            row = db.query(FoodNutrition).filter(FoodNutrition.id == food_id).first()
+            if row is None:
+                return False
+            row.calories_per_100g = calories
+            for key, attr in (
+                ("protein", "protein_per_100g"), ("fat", "fat_per_100g"),
+                ("carbs", "carbs_per_100g"), ("fiber", "fiber_per_100g"),
+            ):
+                val = _num(filled.get(key))
+                if val is not None:
+                    setattr(row, attr, val)
+            category = str(filled.get("category") or "").strip()
+            if category and not row.category:
+                row.category = category
+            name_en = str(filled.get("name_en") or "").strip().lower()
+            if name_en and row.food_name == row.food_name_cn:
+                row.food_name = name_en
+            db.commit()
+            return True
+        except Exception as exc:
+            db.rollback()
+            logger.warning("写回补全营养失败（id=%s）: %s", food_id, exc)
+            return False
+        finally:
+            db.close()
+
+    async def _extract_food_from_web(
+        self, name: str, web_results: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """用大模型从联网检索结果中提取该食物的每 100g 营养数据。"""
+        import asyncio
+
+        context = "\n\n".join(
+            f"[{item.get('title') or '来源'}] {item.get('content', '')[:1500]}"
+            for item in web_results if item.get("content")
+        )
+        if not context.strip():
+            return None
+        prompt = (
+            f"根据下面的网页资料，给出「{name}」每 100g 的标准营养数据。严格要求：\n"
+            "1. 所有数值均为每 100g，单位固定 kcal 或 g；资料给的是某份量总量时必须换算回每 100g。\n"
+            "2. 无法从资料确定的字段填 null，绝不编造；热量无法确定时返回空对象 {}。\n"
+            "3. category 用简体中文大类：水果/蔬菜/肉蛋类/谷物/豆类/坚果/乳制品/水产/主食/其他。\n"
+            "4. 只返回 JSON，不要解释、不要代码块围栏，格式：\n"
+            '{"name_en": "...", "name_cn": "%s", "category": "...", '
+            '"calories": 0, "protein": 0, "fat": 0, "carbs": 0, "fiber": 0}\n\n'
+            "网页资料：\n%s" % (name, context)
+        )
+        try:
+            from langchain_openai import ChatOpenAI
+
+            llm = ChatOpenAI(
+                model=settings.OPENAI_MODEL,
+                openai_api_key=settings.OPENAI_API_KEY,
+                openai_api_base=settings.OPENAI_BASE_URL,
+                temperature=0,
+                max_tokens=500,
+            )
+            response = await asyncio.to_thread(llm.invoke, prompt)
+            raw = response.content if hasattr(response, "content") else str(response)
+            parsed = self._parse_food_object(raw)
+            if parsed and not parsed.get("name_cn"):
+                parsed["name_cn"] = name
+            return parsed
+        except Exception as exc:
+            logger.warning("联网营养补全模型调用失败（%s）: %s", name, exc)
+            return None
+
+    @staticmethod
+    def _parse_food_object(raw: str) -> Optional[Dict[str, Any]]:
+        """解析模型返回的单个食物 JSON 对象（容忍围栏与噪声）。"""
+        import json
+        import re
+
+        if not raw or not isinstance(raw, str):
+            return None
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+            cleaned = re.sub(r"\n?```$", "", cleaned).strip()
+        start, end = cleaned.find("{"), cleaned.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            cleaned = cleaned[start : end + 1]
+        try:
+            data = json.loads(cleaned)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        return data if isinstance(data, dict) and data else None
 
     async def rebuild_graph_from_knowledge(self, user_id: int = 0) -> Dict[str, int]:
         """从已入库的向量文档回填营养图谱。
@@ -243,15 +413,22 @@ class KnowledgeService:
         processed_sources = 0
         foods_count = 0
         for source, text in source_texts[: self._REBUILD_MAX_SOURCES]:
-            foods_count += await self.extract_and_store_graph(text, source=source)
+            # 先只做抽取+入库（含“待补全”条目），不在循环里逐条联网。
+            foods_count += await self.extract_and_store_graph(text, source=source, user_id=user_id)
             processed_sources += 1
 
+        # 再对本次积累的「待补全」食物做一次定向联网补全（数量少、成本可控）。
+        completed = await self.complete_incomplete_foods(user_id)
+
         logger.info(
-            "知识库图谱回填完成：资料=%d，新增/更新食物=%d",
-            processed_sources,
-            foods_count,
+            "知识库图谱回填完成：资料=%d，新增/更新食物=%d，联网补全=%d",
+            processed_sources, foods_count, completed,
         )
-        return {"processed_sources": processed_sources, "foods_count": foods_count}
+        return {
+            "processed_sources": processed_sources,
+            "foods_count": foods_count,
+            "completed_foods": completed,
+        }
 
     @staticmethod
     def _load_graph_source_texts(user_id: int = 0) -> List[Tuple[str, str]]:
@@ -295,15 +472,19 @@ class KnowledgeService:
             "你是营养知识图谱抽取器。从下面的资料中提取被明确讨论、且带营养语境的食物，"
             "为每种食物给出【每 100g】的营养数据。严格要求：\n"
             "1. 只提取资料中真实出现的食物，不要臆造；资料未涉及食物时返回空数组。\n"
-            "2. 所有营养数值必须是【每 100g】的标准值，单位固定为 kcal 或 g：\n"
+            "2. 【重要】当资料主要在介绍某道具名菜肴或成品食物（如『北非蛋』『番茄炒蛋』"
+            "『沙拉』『三明治』）时，必须把这道菜本身作为一个独立食物条目抽取出来，"
+            "category 填『菜肴』，并给出整道菜每 100g 的综合营养估算；"
+            "如果资料同时明确讨论了它的食材营养，可一并抽取食材，但不得用食材替代菜肴本身。\n"
+            "3. 所有营养数值必须是【每 100g】的标准值，单位固定为 kcal 或 g：\n"
             "   - 资料给的是某个份量的总量时（如『200g 鸡胸肉含蛋白质 62g』），"
             "必须换算回每 100g（62÷200×100=31），绝不直接照抄份量总量。\n"
             "   - 资料本身就是每 100g 值时，直接使用。\n"
             "   - 资料没给数值时，用该食物公认的每 100g 标准值；无法确定的字段填 null，绝不编造。\n"
-            "3. category 用简体中文大类：水果/蔬菜/肉蛋类/谷物/豆类/坚果/乳制品/水产/主食/其他。\n"
-            "4. 只返回 JSON，不要解释、不要代码块围栏。所有数值均为每 100g，格式：\n"
-            '{"foods": [{"name_en": "apple", "name_cn": "苹果", "category": "水果", '
-            '"calories": 52, "protein": 0.3, "fat": 0.2, "carbs": 13.8, "fiber": 2.4}]}\n\n'
+            "4. category 用简体中文大类：菜肴/水果/蔬菜/肉蛋类/谷物/豆类/坚果/乳制品/水产/主食/其他。\n"
+            "5. 只返回 JSON，不要解释、不要代码块围栏。所有数值均为每 100g，格式：\n"
+            '{"foods": [{"name_en": "shakshuka", "name_cn": "北非蛋", "category": "菜肴", '
+            '"calories": 110, "protein": 6.5, "fat": 7.2, "carbs": 5.1, "fiber": 1.4}]}\n\n'
             "资料：\n" + text
         )
         try:
@@ -340,8 +521,8 @@ class KnowledgeService:
         foods = data.get("foods") if isinstance(data, dict) else data
         return foods if isinstance(foods, list) else []
 
-    def _store_food_entities(self, foods: List[Dict[str, Any]], source: str) -> int:
-        """将抽取到的食物实体去重后 upsert 进 food_nutrition。"""
+    def _store_food_entities(self, foods: List[Dict[str, Any]], source: str, user_id: int = 0) -> int:
+        """将抽取到的食物实体去重后 upsert 进 food_nutrition（按用户隔离）。"""
         from sqlalchemy import create_engine
         from sqlalchemy.orm import sessionmaker
         from app.entity.db_models import FoodNutrition
@@ -353,6 +534,9 @@ class KnowledgeService:
                 return None
             return num if num >= 0 else None
 
+        # 归属用户统一用 None 表示“无归属”，保证去重过滤与写入一致
+        # （SQLAlchemy 对 == None 生成 IS NULL，能正确匹配无归属历史行）。
+        owner = user_id or None
         engine = create_engine(settings.DATABASE_URL)
         Session = sessionmaker(bind=engine)
         db = Session()
@@ -363,18 +547,19 @@ class KnowledgeService:
                     continue
                 name_cn = str(item.get("name_cn") or "").strip()
                 name_en = str(item.get("name_en") or "").strip().lower()
-                if not name_cn and not name_en:
+                # 至少要有中文名（图谱与查询以中文名为主键）；无中文名信息量不足，跳过。
+                if not name_cn:
                     continue
                 calories = _num(item.get("calories"))
-                # 无中文名或无热量的条目信息量不足，跳过（热量是图谱主营养边）
-                if not name_cn or calories is None:
-                    continue
+                # 缺热量不再丢弃：作为“待补全”条目入库（calories 留空），
+                # 之后由 complete_incomplete_foods 定向联网补全。
 
                 existing = (
                     db.query(FoodNutrition)
                     .filter(
+                        FoodNutrition.user_id == owner,
                         (FoodNutrition.food_name_cn == name_cn)
-                        | ((FoodNutrition.food_name == name_en) & (name_en != ""))
+                        | ((FoodNutrition.food_name == name_en) & (name_en != "")),
                     )
                     .first()
                 )
@@ -386,9 +571,10 @@ class KnowledgeService:
 
                 if existing is None:
                     db.add(FoodNutrition(
+                        user_id=owner,
                         food_name=name_en or name_cn,
                         food_name_cn=name_cn,
-                        calories_per_100g=calories,
+                        calories_per_100g=calories,  # 可能为 None（待补全）
                         protein_per_100g=protein or 0.0,
                         fat_per_100g=fat or 0.0,
                         carbs_per_100g=carbs or 0.0,
@@ -612,17 +798,24 @@ class KnowledgeService:
             logger.error(f"获取统计信息失败: {e}")
             return {"total_chunks": 0, "sources": []}
 
-    async def get_knowledge_graph(self) -> Dict[str, Any]:
-        """构建营养知识图谱（基于 food_nutrition 表）。
-        返回 nodes 和 edges 供前端可视化渲染。
+    async def get_knowledge_graph(self, user_id: int = 0) -> Dict[str, Any]:
+        """构建当前用户的营养知识图谱（基于 food_nutrition 表，按用户隔离）。
+        返回 nodes 和 edges 供前端可视化渲染。仅返回归属于该用户的食物，
+        不同用户的营养数据与图谱互相独立。
         """
         try:
             from sqlalchemy import create_engine, text
             engine = create_engine(settings.DATABASE_URL)
+            # 显式列出字段，避免依赖列顺序（历史实现用 row[11] 取分类，易随表结构变动出错）。
+            # 只取已补全（有热量）的食物；待补全条目不进图谱，补全后自动出现。
+            query = text(
+                "SELECT id, food_name, food_name_cn, calories_per_100g, protein_per_100g, "
+                "fat_per_100g, carbs_per_100g, fiber_per_100g, category "
+                "FROM food_nutrition WHERE user_id = :uid AND calories_per_100g IS NOT NULL "
+                "ORDER BY category, food_name_cn"
+            )
             with engine.connect() as conn:
-                rows = conn.execute(
-                    text("SELECT * FROM food_nutrition ORDER BY category, food_name_cn")
-                ).fetchall()
+                rows = conn.execute(query, {"uid": user_id}).fetchall()
 
             nodes = []
             edges = []
@@ -634,7 +827,6 @@ class KnowledgeService:
                 ("carbs", "碳水化合物", "g"),
                 ("fiber", "膳食纤维", "g"),
             ]
-            col_map = {"calories": 3, "protein": 4, "fat": 5, "carbs": 6, "fiber": 7}
 
             for nid, nlabel, unit in nutrients:
                 nodes.append({
@@ -643,8 +835,9 @@ class KnowledgeService:
                 })
 
             for row in rows:
-                fid = f"food_{row[0]}"
-                cat = row[11] or "未分类"
+                food = row._mapping
+                fid = f"food_{food['id']}"
+                cat = food["category"] or "未分类"
                 cid = f"cat_{cat}"
 
                 if cid not in seen_cats:
@@ -655,17 +848,18 @@ class KnowledgeService:
                     seen_cats.add(cid)
 
                 nodes.append({
-                    "id": fid, "label": row[2], "name_en": row[1],
+                    "id": fid, "label": food["food_name_cn"], "name_en": food["food_name"],
                     "type": "food", "group": "food",
                     "category": cat,
-                    "calories": row[3], "protein": row[4],
-                    "fat": row[5], "carbs": row[6], "fiber": row[7],
+                    "calories": food["calories_per_100g"], "protein": food["protein_per_100g"],
+                    "fat": food["fat_per_100g"], "carbs": food["carbs_per_100g"],
+                    "fiber": food["fiber_per_100g"],
                 })
 
                 edges.append({"source": fid, "target": cid, "relation": "BELONGS_TO"})
 
                 for nid, _, _ in nutrients:
-                    val = row[col_map[nid]]
+                    val = food[f"{nid}_per_100g"]
                     if val and val > 0:
                         edges.append({
                             "source": fid, "target": f"nut_{nid}",

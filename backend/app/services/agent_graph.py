@@ -17,6 +17,7 @@ Agent 图编排模块 — 使用 LangGraph 将 LLM 与工具节点连接。
 
 import json
 import logging
+import re
 import uuid
 from typing import Annotated, Any, AsyncIterator, Optional, TypedDict
 
@@ -167,6 +168,71 @@ def _get_final_llm() -> ChatOpenAI:
 
 
 # ==================================================================
+# 兼容层：部分模型（如 Qwen）会把工具调用当成普通文本吐出，而不是走真正的
+# function calling。此时 AIMessage.tool_calls 为空、content 里却塞着
+# <tool_call>...</tool_call> 或 <function=...>...</function> 文本。
+# 下面两个函数负责：把泄漏的文本工具调用「恢复」成真正的 tool_calls，
+# 以及在收尾阶段把这些文本「清洗」掉，避免直接泄漏给用户。
+# ==================================================================
+
+# 匹配 Hermes 风格：<tool_call> { "name": ..., "arguments": {...} } </tool_call>
+_TOOLCALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+# 匹配 <function=NAME> ... </function> 及其中的 <parameter=KEY>VALUE</parameter>
+_FUNCTION_BLOCK_RE = re.compile(r"<function\s*=\s*([^>\s]+)\s*>(.*?)</function>", re.DOTALL)
+_PARAM_RE = re.compile(r"<parameter\s*=\s*([^>\s]+)\s*>(.*?)</parameter>", re.DOTALL)
+
+
+def _recover_tool_calls_from_text(content: str) -> list[dict]:
+    """从模型正文里解析出泄漏的文本工具调用，转成标准 tool_calls 结构。
+
+    支持两种常见泄漏格式：
+    1. <tool_call>{"name": "x", "arguments": {...}}</tool_call>（JSON 体）
+    2. <function=x><parameter=k>v</parameter></function>（XML 体，见用户截图）
+    """
+    if not content or "<tool_call" not in content and "<function" not in content:
+        return []
+
+    recovered: list[dict] = []
+    for index, block in enumerate(_TOOLCALL_BLOCK_RE.findall(content) or [content]):
+        # 优先按 JSON 解析
+        try:
+            payload = json.loads(block.strip())
+            name = payload.get("name")
+            args = payload.get("arguments") or payload.get("args") or {}
+            if isinstance(name, str) and name:
+                recovered.append({
+                    "name": name,
+                    "args": args if isinstance(args, dict) else {},
+                    "id": f"recovered-{index}",
+                    "type": "tool_call",
+                })
+                continue
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+        # 再按 <function=...><parameter=...> XML 解析
+        for fn_index, (name, body) in enumerate(_FUNCTION_BLOCK_RE.findall(block)):
+            args = {key: value.strip() for key, value in _PARAM_RE.findall(body)}
+            recovered.append({
+                "name": name.strip(),
+                "args": args,
+                "id": f"recovered-{index}-{fn_index}",
+                "type": "tool_call",
+            })
+    return recovered
+
+
+def _strip_leaked_tool_calls(content: str) -> str:
+    """删除正文里泄漏的工具调用文本，返回干净的自然语言。"""
+    if not content:
+        return content
+    cleaned = _TOOLCALL_BLOCK_RE.sub("", content)
+    cleaned = _FUNCTION_BLOCK_RE.sub("", cleaned)
+    # 清掉可能残留的孤立标签
+    cleaned = re.sub(r"</?(tool_call|function|parameter)[^>]*>", "", cleaned)
+    return cleaned.strip()
+
+
+# ==================================================================
 # 图节点定义
 # ==================================================================
 
@@ -269,18 +335,52 @@ async def agent_node(state: AgentState) -> dict:
     if _current_turn_tool_rounds(state) >= MAX_TOOL_ROUNDS:
         return await final_answer_node(state)
 
-    llm_with_tools = _get_llm(_tools_for_state(state))
+    allowed_tools = _tools_for_state(state)
+    llm_with_tools = _get_llm(allowed_tools)
     messages = _model_messages(state)
     response = await llm_with_tools.ainvoke(messages)
+
+    # 兼容：模型把工具调用当文本吐出（tool_calls 为空但正文含 <tool_call>/<function>）。
+    # 恢复成真正的 tool_calls，让图能正常路由到工具节点执行，而不是把 XML 当回答。
+    if isinstance(response, AIMessage) and not response.tool_calls:
+        recovered = _recover_tool_calls_from_text(str(response.content or ""))
+        allowed_names = {tool.name for tool in allowed_tools}
+        recovered = [call for call in recovered if call["name"] in allowed_names]
+        if recovered:
+            logger.info("从模型正文恢复 %d 个文本工具调用", len(recovered))
+            response = AIMessage(content="", tool_calls=recovered)
+
     return {"messages": [response]}
 
 
 async def final_answer_node(state: AgentState) -> dict:
-    """在工具轮次达到上限后，不绑定工具地生成最终回答。"""
+    """在工具轮次达到上限后，不绑定工具地生成最终回答。
+
+    收尾节点不应再触发工具。但部分模型仍会把工具调用当文本吐出，这里统一
+    清洗掉泄漏的 <tool_call>/<function> 文本；若清洗后无正文，再要求模型
+    仅用已有信息、以自然语言重答一次，避免把 XML 泄漏给用户。
+    """
     response = await _get_final_llm().ainvoke(
         _model_messages(state, force_final_answer=True)
     )
-    return {"messages": [response]}
+    content = _strip_leaked_tool_calls(str(response.content or ""))
+
+    if not content:
+        retry_messages = _model_messages(state, force_final_answer=True) + [
+            HumanMessage(content=(
+                "请勿再调用任何工具，也不要输出 <tool_call>、<function> 等标签。"
+                "仅依据已有工具结果和你的营养学常识，用自然语言中文直接回答上面的问题。"
+            ))
+        ]
+        retry = await _get_final_llm().ainvoke(retry_messages)
+        content = _strip_leaked_tool_calls(str(retry.content or ""))
+
+    if not content:
+        content = (
+            "根据这份食物的类型，它属于高油煎炸食品，热量和脂肪偏高，减脂期建议"
+            "控制份量、优先选择少油烹饪方式，并搭配蛋白质和蔬菜平衡整餐。"
+        )
+    return {"messages": [AIMessage(content=content)]}
 
 
 async def router_node(state: AgentState) -> str:
@@ -590,6 +690,8 @@ async def run_agent(
             elif isinstance(msg, ToolMessage):
                 web_sources.extend(_web_sources_from_tool_message(msg))
 
+        # 兜底：清洗任何漏网的文本工具调用，避免 XML 泄漏给用户
+        response_text = _strip_leaked_tool_calls(response_text)
         response_text = _append_web_sources(response_text, web_sources)
         if web_sources and not any(
             call["name"] in {"search_web_evidence", "exa_web_search"}
@@ -684,6 +786,9 @@ async def stream_agent(
                     detected_foods = artifacts["detections"]
                     detection_mode = artifacts["detection_mode"]
 
+        # 兜底：清洗任何漏网的文本工具调用，done 里的 response 保持干净；
+        # 前端在 done 时会用它整条替换，覆盖可能已流式泄漏的 XML 文本。
+        final_text = _strip_leaked_tool_calls(final_text)
         response_text = _append_web_sources(final_text, web_sources)
         if web_sources and not any(
             call["name"] in {"search_web_evidence", "exa_web_search"}

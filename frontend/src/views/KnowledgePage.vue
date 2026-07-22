@@ -6,10 +6,23 @@
         <h1 class="page-title">把营养知识，<br><em>变成行动。</em></h1>
         <p class="page-description">{{ activeView === 'library' ? '检索可信资料中的饮食建议，用它校准下一餐、下一次训练和你的减脂计划。' : '从食物、分类与营养素的连接中，更直观地理解每一种选择。' }}</p>
       </div>
-      <button class="refresh-button" :disabled="currentViewLoading" :aria-label="activeView === 'library' ? '刷新知识库统计' : '刷新营养知识图谱'" @click="refreshCurrentView">
-        <ArrowsClockwise :size="18" :class="{ spinning: currentViewLoading }" aria-hidden="true" />
-        刷新
-      </button>
+      <div class="hero-actions">
+        <button
+          v-if="activeView === 'graph'"
+          class="refresh-button rebuild-button"
+          :disabled="rebuilding || currentViewLoading"
+          aria-label="用最新规则重建营养图谱"
+          title="对已上传资料重新抽取，把成品菜肴等补进图谱"
+          @click="rebuildGraph"
+        >
+          <ArrowsClockwise :size="18" :class="{ spinning: rebuilding }" aria-hidden="true" />
+          {{ rebuilding ? '重建中…' : '重建图谱' }}
+        </button>
+        <button class="refresh-button" :disabled="currentViewLoading" :aria-label="activeView === 'library' ? '刷新知识库统计' : '刷新营养知识图谱'" @click="refreshCurrentView">
+          <ArrowsClockwise :size="18" :class="{ spinning: currentViewLoading }" aria-hidden="true" />
+          刷新
+        </button>
+      </div>
     </header>
 
     <nav class="library-sections surface" aria-label="知识库视图">
@@ -256,7 +269,7 @@ import CountUp from '@/components/motion/CountUp.vue'
 import SpotlightCard from '@/components/motion/SpotlightCard.vue'
 import FuelButton from '@/components/ui/FuelButton.vue'
 import NutritionKnowledgeGraph from '@/components/knowledge/NutritionKnowledgeGraph.vue'
-import { askKnowledgeApi, deleteDocumentApi, getKnowledgeGraphApi, getKnowledgeStatsApi, searchKnowledgeApi, uploadDocumentApi } from '@/api/knowledge'
+import { askKnowledgeApi, deleteDocumentApi, getKnowledgeGraphApi, getKnowledgeStatsApi, getRebuildStatusApi, rebuildKnowledgeGraphApi, searchKnowledgeApi, uploadDocumentApi } from '@/api/knowledge'
 import { useUserStore } from '@/stores/user'
 import { normalizeKnowledgeAnswer, normalizeKnowledgeGraph, normalizeKnowledgeSearch, normalizeKnowledgeStats } from '@/utils/knowledgeData'
 import { renderMarkdown } from '@/utils/markdown'
@@ -272,6 +285,7 @@ const statsLoading = ref(false)
 const graphLoading = ref(false)
 const graphLoaded = ref(false)
 const graphError = ref('')
+const rebuilding = ref(false)
 const query = ref('')
 const limit = ref(5)
 const mode = ref('ask')
@@ -340,6 +354,62 @@ function setActiveView(view) {
 function refreshCurrentView() {
   if (activeView.value === 'graph') loadGraph()
   else loadStats()
+}
+
+async function rebuildGraph() {
+  if (rebuilding.value) return
+  if (userStore.isDemo) {
+    ElMessage.info('预览模式：重建图谱不可用')
+    return
+  }
+  try {
+    await ElMessageBox.confirm(
+      '将用最新规则对你已上传的资料重新抽取营养图谱（成品菜肴等会被补进来）。'
+      + '过程会调用模型，可能需要一两分钟，是否继续？',
+      '重建营养图谱',
+      { type: 'info', confirmButtonText: '开始重建', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  rebuilding.value = true
+  try {
+    await rebuildKnowledgeGraphApi()
+    // 后台任务：轮询进度，最多等约 5 分钟（60 × 5s）。
+    const result = await pollRebuildStatus()
+    if (result?.status === 'done') {
+      const foods = result.foods_count ?? 0
+      const sources = result.processed_sources ?? 0
+      ElMessage.success(`重建完成：处理 ${sources} 份资料，新增/更新 ${foods} 种食物`)
+      await loadGraph()
+    } else if (result?.status === 'failed') {
+      ElMessage.error(`重建失败：${result.error || '请稍后重试'}`)
+    } else {
+      ElMessage.info('重建仍在后台进行，稍后刷新图谱即可看到结果')
+    }
+  } catch {
+    ElMessage.error('重建启动失败，请稍后重试')
+  } finally {
+    rebuilding.value = false
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+async function pollRebuildStatus(maxAttempts = 60, intervalMs = 5000) {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    await sleep(intervalMs)
+    let state
+    try {
+      state = payloadData(await getRebuildStatusApi())
+    } catch {
+      continue  // 单次查询失败不终止轮询
+    }
+    if (state?.status === 'done' || state?.status === 'failed') return state
+  }
+  return { status: 'running' }
 }
 
 async function loadGraph() {
@@ -509,8 +579,11 @@ onMounted(loadStats)
 .hero em { color: var(--primary); font-style: normal; }
 .eyebrow, .panel-kicker { color: var(--primary); font-size: .74rem; font-weight: 700; letter-spacing: .13em; }
 .eyebrow { margin-bottom: 17px; display: flex; align-items: center; gap: 8px; }
+.hero-actions { display: flex; align-items: center; gap: 8px; }
 .refresh-button { min-height: 42px; padding: 0 14px; display: inline-flex; align-items: center; gap: 8px; color: var(--text-secondary); background: rgba(255,255,255,.035); border: 1px solid var(--border); border-radius: 10px; }
-.refresh-button:hover { color: var(--primary); border-color: rgba(159,226,75,.35); }
+.refresh-button:hover:not(:disabled) { color: var(--primary); border-color: rgba(159,226,75,.35); }
+.refresh-button:disabled { opacity: .5; cursor: not-allowed; }
+.rebuild-button { color: var(--primary); border-color: rgba(159,226,75,.28); background: var(--primary-soft); }
 .spinning { animation: spin .8s linear infinite; }
 .library-sections { padding: 5px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; }
 .library-sections button { min-height: 68px; padding: 10px 16px; display: flex; align-items: center; gap: 11px; color: var(--muted); background: transparent; border: 1px solid transparent; border-radius: 11px; text-align: left; transition: color 170ms var(--ease-out), background 170ms var(--ease-out), border-color 170ms var(--ease-out); }

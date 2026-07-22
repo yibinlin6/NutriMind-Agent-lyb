@@ -30,27 +30,37 @@ from typing import AsyncIterator
 _graph_tasks: set[asyncio.Task] = set()
 
 
-async def _extract_conversation_graph(user_message: str, response_text: str) -> int:
-    """从一轮完整对话抽取食物实体，并等待数据库提交完成。"""
+async def _extract_conversation_graph(
+    user_message: str, response_text: str, user_id: int | None = None,
+) -> int:
+    """从一轮完整对话抽取食物实体，写入当前用户的营养库/图谱。"""
     combined = f"{user_message}\n\n{response_text}".strip()
     if not combined:
         return 0
     try:
-        count = await knowledge_service.extract_and_store_graph(combined, source="对话抽取")
-        logger.info("对话图谱抽取完成：新增/更新 %d 种食物", count)
+        count = await knowledge_service.extract_and_store_graph(
+            combined, source="对话抽取", user_id=user_id or 0,
+        )
+        logger.info("对话图谱抽取完成：新增/更新 %d 种食物（user_id=%s）", count, user_id)
         return count
     except Exception as exc:
         logger.warning("对话图谱抽取失败: %s", exc)
         return 0
 
 
-def _schedule_graph_extraction(user_message: str, response_text: str) -> None:
-    """为非流式接口调度图谱抽取，并持有任务引用直到完成。"""
+def _schedule_graph_extraction(
+    user_message: str, response_text: str, user_id: int | None = None,
+) -> None:
+    """后台调度图谱抽取（fire-and-forget），并持有任务引用直到完成。
+
+    抽取独立于回复主流程：使用自建数据库会话，不阻塞 SSE 完成事件，
+    也不受请求级会话关闭影响。
+    """
     if not f"{user_message}{response_text}".strip():
         return
 
     async def _run():
-        await _extract_conversation_graph(user_message, response_text)
+        await _extract_conversation_graph(user_message, response_text, user_id)
 
     task = asyncio.create_task(_run())
     _graph_tasks.add(task)
@@ -134,8 +144,8 @@ async def _invoke_chat(
             db.rollback()
             logger.warning("保存智能体回复失败: %s", exc)
 
-    # 对话结束后后台抽取食物实体进图谱
-    _schedule_graph_extraction(message, result.get("response", ""))
+    # 对话结束后后台抽取食物实体进图谱（按用户隔离）
+    _schedule_graph_extraction(message, result.get("response", ""), user_id)
 
     return ChatResponse(
         session_id=session_id,
@@ -209,9 +219,7 @@ async def _stream_chat_events(
                     event = {**event, **extra_done}
                 response_text = str(event.get("response") or streamed_text)
 
-                # 先通知前端进入同步阶段，避免图谱抽取期间被空闲超时误杀。
-                yield _sse({"type": "sync", "stage": "persisting"})
-
+                # 先可靠落库助手回复，再发 done —— 保证历史与图片引用在前端收尾前已持久化。
                 if persisted_session is not None:
                     try:
                         chat_service.append_message(
@@ -226,17 +234,8 @@ async def _stream_chat_events(
                         db.rollback()
                         logger.warning("保存流式智能体回复失败: %s", exc)
 
-                graph_task = asyncio.create_task(
-                    _extract_conversation_graph(message, response_text)
-                )
-                _graph_tasks.add(graph_task)
-                graph_task.add_done_callback(_graph_tasks.discard)
-                while not graph_task.done():
-                    done, _ = await asyncio.wait({graph_task}, timeout=15)
-                    if not done:
-                        yield _sse({"type": "sync", "stage": "updating_graph"})
-                graph_foods_count = graph_task.result()
-                event = {**event, "graph_foods_count": graph_foods_count}
+                # 图谱抽取走后台任务（独立会话），不阻塞 done —— 避免慢速抽取拖垮流式收尾。
+                _schedule_graph_extraction(message, response_text, user_id)
             elif event_type == "error":
                 error_text = str(event.get("message") or "智能体处理失败，请稍后重试。")
                 if persisted_session is not None:
@@ -432,6 +431,10 @@ async def _invoke_image_chat(
         except Exception as exc:
             db.rollback()
             logger.warning("保存图片会话智能体回复失败: %s", exc)
+
+    # 图片餐食对话也抽取食物实体进当前用户的营养库/图谱
+    _schedule_graph_extraction(message.strip(), result.get("response", ""), user_id)
+
     return ImageChatResponse(
         session_id=external_session_id,
         image_id=image_id,

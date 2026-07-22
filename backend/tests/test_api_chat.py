@@ -458,13 +458,16 @@ def test_conversation_extraction_uses_combined_text():
     async def _scenario():
         captured = {}
 
-        async def _fake_extract(text, source=""):
+        async def _fake_extract(text, source="", user_id=0):
             captured["text"] = text
             captured["source"] = source
+            captured["user_id"] = user_id
             return 2
 
         with patch.object(chat_api.knowledge_service, "extract_and_store_graph", new=_fake_extract):
-            chat_api._schedule_graph_extraction("我今天吃了鸡胸肉", "鸡胸肉每100g蛋白质31g，很适合减脂。")
+            chat_api._schedule_graph_extraction(
+                "我今天吃了鸡胸肉", "鸡胸肉每100g蛋白质31g，很适合减脂。", user_id=42,
+            )
             # 让后台任务跑完
             await asyncio.sleep(0)
             while chat_api._graph_tasks:
@@ -475,6 +478,7 @@ def test_conversation_extraction_uses_combined_text():
     assert "鸡胸肉" in captured["text"]
     assert "蛋白质31g" in captured["text"]
     assert captured["source"] == "对话抽取"
+    assert captured["user_id"] == 42
 
 
 def test_conversation_extraction_skips_empty_text():
@@ -505,8 +509,8 @@ def _parse_sse(body: str) -> list[dict]:
     return events
 
 
-def test_stream_persists_reply_and_graph_before_done(db):
-    """done 到达前，用户/助手消息和图谱抽取都应已经完成。"""
+def test_stream_persists_reply_before_done_and_schedules_user_scoped_graph(db):
+    """done 到达前用户/助手消息已落库；图谱抽取以当前用户身份后台调度。"""
     import app.api.chat as chat_api
 
     user = User(
@@ -527,26 +531,24 @@ def test_stream_persists_reply_and_graph_before_done(db):
             "detection_mode": None,
         }
 
-    async def _fake_extract(_question, _response):
-        check_db = session_factory()
-        try:
-            roles = [
-                item.role for item in check_db.query(ChatMessage)
-                .order_by(ChatMessage.id)
-                .all()
-            ]
-            assert roles == ["user", "assistant"]
-        finally:
-            check_db.close()
+    captured = {}
+
+    async def _fake_extract(question, response, user_id=None):
+        captured["user_id"] = user_id
+        captured["text"] = f"{question}\n\n{response}"
         return 1
 
     async def _collect():
-        return [frame async for frame in chat_api._stream_chat_events(
+        frames = [frame async for frame in chat_api._stream_chat_events(
             session_id="stream-persist-001",
             message="鸡胸肉有什么营养？",
             thread_prefix="user:703",
             user_id=user.id,
         )]
+        # 抽取是后台 fire-and-forget，等它跑完再断言
+        while chat_api._graph_tasks:
+            await asyncio.gather(*list(chat_api._graph_tasks))
+        return frames
 
     with patch.object(chat_api, "get_session_local", return_value=session_factory), \
             patch.object(chat_api, "stream_agent", new=_fake_stream), \
@@ -559,8 +561,12 @@ def test_stream_persists_reply_and_graph_before_done(db):
         ("user", "鸡胸肉有什么营养？"),
         ("assistant", "鸡胸肉富含蛋白质。"),
     ]
+    # done 立即下发，不再阻塞在图谱抽取上
     done = next(event for event in events if event["type"] == "done")
-    assert done["graph_foods_count"] == 1
+    assert done["response"] == "鸡胸肉富含蛋白质。"
+    # 图谱抽取按当前用户隔离调度
+    assert captured["user_id"] == 703
+    assert "鸡胸肉" in captured["text"]
 
 
 def test_stream_error_still_persists_assistant_record(db):
@@ -639,6 +645,75 @@ def test_message_stream_endpoint_emits_sse_events(db):
     done = next(event for event in events if event["type"] == "done")
     assert done["response"] == "这餐约 250 kcal。"
     assert done["tool_calls"][0]["name"] == "query_food_calories"
+
+
+def test_recovers_xml_tool_call_leaked_as_text():
+    """模型把工具调用当文本吐出（<function=...> 形式）时应能恢复成真正的 tool_calls。"""
+    leaked = (
+        "<tool_call>\n<function=query_food_calories>\n"
+        "<parameter=food_name>\n薯条\n</parameter>\n</function>\n</tool_call>"
+    )
+    recovered = agent_graph._recover_tool_calls_from_text(leaked)
+    assert len(recovered) == 1
+    assert recovered[0]["name"] == "query_food_calories"
+    assert recovered[0]["args"]["food_name"] == "薯条"
+    # 清洗后不应再残留任何标签文本
+    assert agent_graph._strip_leaked_tool_calls(leaked) == ""
+
+
+def test_recovers_hermes_json_tool_call_leaked_as_text():
+    """Hermes JSON 体的文本工具调用也应能恢复。"""
+    leaked = '<tool_call>{"name": "query_food_calories", "arguments": {"food_name": "apple"}}</tool_call>'
+    recovered = agent_graph._recover_tool_calls_from_text(leaked)
+    assert recovered[0]["name"] == "query_food_calories"
+    assert recovered[0]["args"]["food_name"] == "apple"
+
+
+def test_agent_node_recovers_leaked_tool_call_into_real_tool_calls():
+    """agent_node 收到「文本工具调用」时应转成真正的 tool_calls，让图能路由到工具节点。"""
+    class _LeakingModel:
+        def bind_tools(self, _tools):
+            return self
+
+        async def ainvoke(self, _messages):
+            return AIMessage(content=(
+                "<tool_call><function=query_food_calories>"
+                "<parameter=food_name>薯条</parameter></function></tool_call>"
+            ))
+
+    state = {"messages": [HumanMessage(content="薯条的热量是多少？")]}
+    with patch("app.services.agent_graph._get_base_llm", return_value=_LeakingModel()):
+        result = asyncio.run(agent_graph.agent_node(state))
+
+    message = result["messages"][0]
+    assert message.tool_calls
+    assert message.tool_calls[0]["name"] == "query_food_calories"
+    assert message.tool_calls[0]["args"]["food_name"] == "薯条"
+
+
+def test_final_answer_node_strips_leaked_tool_call_and_returns_prose():
+    """收尾节点必须清洗泄漏的工具调用文本，绝不把 XML 当回答返回给用户。"""
+    class _LeakThenAnswerModel:
+        def __init__(self):
+            self.calls = 0
+
+        async def ainvoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content=(
+                    "<tool_call><function=query_food_calories>"
+                    "<parameter=food_name>薯条</parameter></function></tool_call>"
+                ))
+            return AIMessage(content="薯条属于高油煎炸食品，减脂期建议控制份量。")
+
+    model = _LeakThenAnswerModel()
+    state = {"messages": [HumanMessage(content="薯条有利于减肥吗？")]}
+    with patch("app.services.agent_graph._get_final_llm", return_value=model):
+        result = asyncio.run(agent_graph.final_answer_node(state))
+
+    content = result["messages"][0].content
+    assert "<tool_call>" not in content and "<function" not in content
+    assert "薯条" in content
 
 
 def test_stream_agent_maps_events_and_appends_web_sources():

@@ -58,6 +58,10 @@ class Settings(BaseSettings):
     WEB_SEARCH_ENABLED: bool = True
     WEB_SEARCH_STORE_RESULTS: bool = True
     KNOWLEDGE_LOCAL_SCORE_THRESHOLD: float = 0.85
+    # 图谱抽取兜底：资料里提到的食物营养不全（缺热量）时，自动联网补全每 100g 数据，
+    # 补全后再入库，避免因缺数值被丢弃而无法进图谱。上限控制单次上传的补全成本。
+    KNOWLEDGE_GRAPH_WEB_COMPLETE: bool = True
+    KNOWLEDGE_GRAPH_WEB_COMPLETE_MAX: int = 5
 
     # LangChain 配置（可选）
     LANGCHAIN_TRACING_V2: bool = False
