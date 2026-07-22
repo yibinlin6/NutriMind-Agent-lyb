@@ -295,7 +295,7 @@ npm run android:apk  # 生成可直接侧载的 debug APK
 npm run tauri:build  # 生成当前操作系统的桌面安装包
 ```
 
-GitHub Actions 可在手动触发或推送 `v*` 标签时自动构建 APK 和桌面产物，具体说明见 [`frontend/README.md`](frontend/README.md)。
+GitHub Actions 可在手动触发时生成测试产物；推送 `v*` 标签会自动构建 APK 和各平台桌面安装包，并作为附件发布到同名 GitHub Release。具体说明见 [`frontend/README.md`](frontend/README.md)。
 
 ---
 
