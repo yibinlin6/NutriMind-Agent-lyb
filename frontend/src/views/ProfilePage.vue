@@ -201,6 +201,7 @@ import FuelField from '@/components/ui/FuelField.vue'
 import {
   deleteAvatarApi, getProfileApi, updateProfileApi, uploadAvatarApi,
 } from '@/api/profile'
+import { apiUrl } from '@/utils/apiUrl'
 import { useUserStore } from '@/stores/user'
 import {
   emptyProfileForm, legacyProfileToPatch, normalizeAvatarResponse,
@@ -251,7 +252,7 @@ const displayUsername = computed(() => accountInfo.value.username || userStore.u
 const roleText = computed(() => accountInfo.value.roles?.join('、') || '普通用户')
 const userInitial = computed(() => displayUsername.value.slice(0, 1).toUpperCase() || 'N')
 const avatarUrl = computed(() => {
-  const source = accountInfo.value.avatar
+  const source = apiUrl(accountInfo.value.avatar)
   if (!source) return ''
   const separator = source.includes('?') ? '&' : '?'
   return `${source}${separator}v=${avatarVersion.value}`

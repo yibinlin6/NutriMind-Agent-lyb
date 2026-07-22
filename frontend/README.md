@@ -69,6 +69,52 @@ http://电脑IPv4地址:3000
 
 例如电脑地址是 `192.168.1.20`，手机访问 `http://192.168.1.20:3000`。如果无法打开，请检查 Windows 防火墙是否允许 Node.js 或 TCP 3000 端口通过专用网络。
 
+## 原生应用打包
+
+原生应用只封装 Vue 前端；AI、数据库、图片和模型服务继续运行在 `https://nutrimind.chat`。`npm run build:native` 会读取提交的 `.env.native`，让 Axios、SSE 流和后端返回的相对图片地址统一请求该线上服务。
+
+### Android APK
+
+```bash
+cd frontend
+npm install
+npm run android:apk
+```
+
+产物位置：
+
+```text
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+这是 Gradle 自动生成 debug keystore 签名的可侧载 APK，不需要 Google Play、Google 服务或 release keystore。安装到 Android 手机时，按系统提示允许该来源安装即可；只有要提交 Google Play 时才需要改为 release keystore 签名并生成 AAB。
+
+### 桌面安装包
+
+```bash
+cd frontend
+npm run tauri:build
+```
+
+Tauri 会将前端静态资源打入各自平台的安装包。Windows、macOS 和 Linux 需分别在对应系统上构建；GitHub Actions 已提供三平台矩阵构建。
+
+### GitHub Actions
+
+- `.github/workflows/ci.yml`：每次推送或 PR 执行前端测试、浏览器构建和原生前端构建。
+- `.github/workflows/android-apk.yml`：手动运行或推送 `v*` 标签时生成 `app-debug.apk`。在 Actions Artifacts 下载；标签构建还会附加到 GitHub Release。
+- `.github/workflows/desktop.yml`：手动运行或推送 `v*` 标签时构建 Windows、macOS、Linux 安装包并上传为 Artifacts。
+
+### 线上后端配置
+
+部署 `nutrimind.chat` 的后端环境变量必须允许原生壳的跨域请求。生产环境建议至少设置：
+
+```env
+AUTH_COOKIE_SECURE=true
+ALLOWED_ORIGINS=https://nutrimind.chat,capacitor://localhost,http://localhost,http://tauri.localhost,tauri://localhost
+```
+
+原生壳在登录后使用后端已经返回的 Bearer JWT，避免依赖 WebView 的跨域 Cookie 行为；浏览器站点继续使用 HttpOnly Cookie。
+
 ## 身份与页面入口
 
 ### 普通用户

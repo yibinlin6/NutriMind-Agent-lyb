@@ -1,3 +1,5 @@
+import { apiUrl } from './apiUrl'
+
 function unwrapApiData(payload) {
   const firstLayer = payload?.data ?? payload
   return firstLayer?.data ?? firstLayer
@@ -74,7 +76,7 @@ export function normalizeDetectionTask(source = {}) {
     sceneName: text(source.scene_name_cn ?? source.scene_name ?? scene.name_cn ?? scene.name),
     sceneId: source.scene_id ?? scene.id ?? null,
     fileName: text(source.file_name ?? source.filename ?? source.original_filename),
-    imageUrl: text(source.image_url ?? source.original_image_url ?? source.result_image_url),
+    imageUrl: apiUrl(text(source.image_url ?? source.original_image_url ?? source.result_image_url)),
     totalObjects: numberOrNull(source.total_objects ?? source.detection_count) ?? normalizedResult.totalObjects,
     inferenceTime: numberOrNull(source.inference_time) ?? normalizedResult.inferenceTime,
     confThreshold: numberOrNull(source.conf_threshold),

@@ -1,4 +1,6 @@
 import request from '@/utils/request'
+import { apiUrl } from '@/utils/apiUrl'
+import { withNativeAuthorization } from '@/utils/authToken'
 
 // 经典（非流式）模式的超时放宽：智能体走多工具+联网时可能需要数分钟。
 const TEXT_CHAT_TIMEOUT = 300000   // 5 分钟
@@ -159,10 +161,10 @@ async function consumeStream(response, { signal, onEvent }) {
 export async function streamChatMessageApi({ sessionId, message, detections } = {}, { signal, onEvent } = {}) {
   const body = { session_id: sessionId, message }
   if (Array.isArray(detections) && detections.length) body.detections = detections
-  const response = await fetch('/api/chat/message/stream', {
+  const response = await fetch(apiUrl('/api/chat/message/stream'), {
     method: 'POST',
     credentials: 'include',
-    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    headers: withNativeAuthorization({ 'Content-Type': 'application/json', Accept: 'text/event-stream' }),
     body: JSON.stringify(body),
     signal,
   })
@@ -175,10 +177,10 @@ export async function streamChatImageApi(file, { sessionId, message } = {}, { si
   form.append('file', file)
   form.append('message', message)
   if (sessionId) form.append('session_id', sessionId)
-  const response = await fetch('/api/chat/image/stream', {
+  const response = await fetch(apiUrl('/api/chat/image/stream'), {
     method: 'POST',
     credentials: 'include',
-    headers: { Accept: 'text/event-stream' },
+    headers: withNativeAuthorization({ Accept: 'text/event-stream' }),
     body: form,
     signal,
   })

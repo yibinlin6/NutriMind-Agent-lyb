@@ -65,7 +65,11 @@ class Settings(BaseSettings):
     LANGCHAIN_PROJECT: str = "visagent"
 
     # CORS 配置
-    ALLOWED_ORIGINS: str = "http://localhost:3000,http://localhost:5173"
+    # 浏览器站点与 Capacitor/Tauri 原生壳都需要显式列出；allow_credentials=True 时不能使用通配符。
+    ALLOWED_ORIGINS: str = (
+        "http://localhost:3000,http://localhost:5173,https://nutrimind.chat,"
+        "capacitor://localhost,http://localhost,http://tauri.localhost,tauri://localhost"
+    )
 
     # 路径配置
     BASE_DIR: Path = Path(__file__).resolve().parent.parent.parent
