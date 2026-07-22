@@ -1,6 +1,8 @@
 import { defineStore } from 'pinia'
 import { getCurrentUserApi, loginApi, logoutApi } from '@/api/auth'
 import { getDefaultRouteForUser, isAdminUser, isUserRoleResolved } from '@/utils/userAccess'
+import { apiUrl } from '@/utils/apiUrl'
+import { clearNativeAccessToken, saveNativeAccessToken } from '@/utils/authToken'
 
 const USER_KEY = 'nutrimind_user'
 
@@ -13,7 +15,7 @@ function readUser() {
 
 function versionedAvatarUrl(avatar, revision) {
   if (typeof avatar !== 'string' || !avatar.trim()) return ''
-  const source = avatar.trim()
+  const source = apiUrl(avatar.trim())
   const separator = source.includes('?') ? '&' : '?'
   return `${source}${separator}avatar_v=${revision}`
 }
@@ -47,10 +49,12 @@ export const useUserStore = defineStore('user', {
     },
     clearSession() {
       this.user = null
+      clearNativeAccessToken()
       localStorage.removeItem(USER_KEY)
     },
     async login(credentials) {
       const result = await loginApi(credentials)
+      saveNativeAccessToken(result?.access_token)
       const user = await getCurrentUserApi()
       this.saveUser(user || result.user)
       this.sessionResolved = true

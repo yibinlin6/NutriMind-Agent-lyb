@@ -195,7 +195,7 @@ uv run pytest -v
 | `DEFAULT_DETECTION_MODEL` | `best.pt` | 模型文件名 |
 | `DB_HOST` / `DB_PORT` | `localhost` / `5432` | PostgreSQL 配置 |
 | `DEBUG` | `true` | `false` 关闭 mock 联调接口 |
-| `ALLOWED_ORIGINS` | `localhost:3000,localhost:5173` | CORS 白名单 |
+| `ALLOWED_ORIGINS` | 本地开发 + `nutrimind.chat` + 原生壳 Origin | CORS 白名单 |
 
 ### 启用真实 YOLO 检测
 
@@ -284,6 +284,18 @@ YOLO11s (conf=0.1)
 npm install
 npm run dev        # http://localhost:3000，/api 代理到 9999
 ```
+
+### 原生客户端
+
+前端已接入 Capacitor Android 与 Tauri 桌面端。原生壳只打包 Vue 静态资源，统一访问已部署的 `https://nutrimind.chat/api`，不会把 FastAPI、YOLO 模型或数据库打进 APK/桌面安装包。
+
+```bash
+cd frontend
+npm run android:apk  # 生成可直接侧载的 debug APK
+npm run tauri:build  # 生成当前操作系统的桌面安装包
+```
+
+GitHub Actions 可在手动触发或推送 `v*` 标签时自动构建 APK 和桌面产物，具体说明见 [`frontend/README.md`](frontend/README.md)。
 
 ---
 

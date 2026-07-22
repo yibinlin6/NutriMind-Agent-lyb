@@ -1,3 +1,5 @@
+import { apiUrl } from './apiUrl'
+
 function unwrapChatData(payload) {
   const firstLayer = payload?.data ?? payload
   if (firstLayer?.response !== undefined || firstLayer?.session_id !== undefined) return firstLayer
@@ -24,7 +26,7 @@ function normalizeChatMessage(item = {}, index = 0) {
     role,
     content: text(item?.content || item?.message),
     imageId: text(item?.image_id || item?.imageId),
-    imageUrl: text(item?.image_url || item?.imageUrl),
+    imageUrl: apiUrl(text(item?.image_url || item?.imageUrl)),
     toolCalls: normalizeToolCalls(item?.tool_calls || item?.toolCalls),
     createdAt: text(item?.created_at || item?.createdAt),
   }
