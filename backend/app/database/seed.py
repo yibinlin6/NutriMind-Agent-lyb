@@ -42,6 +42,23 @@ def init_db() -> None:
             logger.info("升级 chat_messages：添加 image_id 列")
             with engine.begin() as connection:
                 connection.execute(text("ALTER TABLE chat_messages ADD COLUMN image_id VARCHAR(64)"))
+    # 营养库按用户隔离：为历史部署补 user_id 列。历史行没有归属用户，
+    # 隔离后对任何人都不可见，按产品决定直接清空，避免残留脏数据。
+    if "food_nutrition" in inspector.get_table_names():
+        columns = {c["name"]: c for c in inspector.get_columns("food_nutrition")}
+        if "user_id" not in columns:
+            logger.info("升级 food_nutrition：清空历史数据并添加 user_id 列")
+            with engine.begin() as connection:
+                connection.execute(text("DELETE FROM food_nutrition"))
+                connection.execute(text("ALTER TABLE food_nutrition ADD COLUMN user_id INTEGER"))
+        # 热量改为可空：允许“待补全”食物先入库
+        calories_col = columns.get("calories_per_100g")
+        if calories_col is not None and not calories_col.get("nullable", True):
+            logger.info("升级 food_nutrition：calories_per_100g 改为可空（支持待补全）")
+            with engine.begin() as connection:
+                connection.execute(text(
+                    "ALTER TABLE food_nutrition ALTER COLUMN calories_per_100g DROP NOT NULL"
+                ))
 
 
 def init_seed() -> None:

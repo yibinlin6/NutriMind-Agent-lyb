@@ -197,13 +197,20 @@ class TrainingTask(Base):
 
 
 class FoodNutrition(Base):
-    """食物营养信息表 — 存储常用食物的营养数据，供 Agent 工具查询"""
+    """食物营养信息表 — 存储常用食物的营养数据，供 Agent 工具查询。
+
+    user_id 用于按用户隔离：每个用户的营养数据库与知识图谱互相独立。
+    user_id 为空表示无归属（历史数据），对所有用户不可见。
+    """
     __tablename__ = "food_nutrition"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True, comment="归属用户 ID（按用户隔离）")
     food_name = Column(String(100), nullable=False, index=True, comment="食物英文名")
     food_name_cn = Column(String(100), nullable=False, index=True, comment="食物中文名")
-    calories_per_100g = Column(Float, nullable=False, comment="每100g 热量（kcal）")
+    # 热量可空：资料提到但暂缺数值的食物先入库当“待补全清单”，补全后再填。
+    # 缺热量视为不完整，不进图谱、不参与 Agent 营养计算，直到被联网补全。
+    calories_per_100g = Column(Float, nullable=True, comment="每100g 热量（kcal），空=待补全")
     protein_per_100g = Column(Float, default=0.0, comment="每100g 蛋白质（g）")
     fat_per_100g = Column(Float, default=0.0, comment="每100g 脂肪（g）")
     carbs_per_100g = Column(Float, default=0.0, comment="每100g 碳水化合物（g）")

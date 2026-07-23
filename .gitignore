@@ -1,4 +1,8 @@
 backend/.coverage
 backend/test.db
 backend/data/captures/
+doc/*.pdf
+doc/*.doc
+doc/*.docx
+doc/
 # backend/uv.lock

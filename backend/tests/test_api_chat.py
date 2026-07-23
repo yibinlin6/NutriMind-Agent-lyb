@@ -3,12 +3,14 @@ import json
 from unittest.mock import AsyncMock, patch
 
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import sessionmaker
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from fastapi.testclient import TestClient
 
 from app.core.security import get_current_user
-from app.entity.db_models import BodyProfile, GoalProfile, User
+from app.entity.db_models import BodyProfile, ChatMessage, GoalProfile, User
+from app.entity.schemas import ChatRequest
 from main import app
 from app.config.settings import settings
 from app.services.agent_tools import calculate_total_nutrition, detect_food, query_food_calories
@@ -30,7 +32,8 @@ def test_chat_message_passes_detection_context():
         "analysis_result": None,
     }
     try:
-        with patch("app.api.chat.run_agent", new=AsyncMock(return_value=agent_result)) as mocked:
+        with patch("app.api.chat.run_agent", new=AsyncMock(return_value=agent_result)) as mocked, \
+                patch("app.api.chat._schedule_graph_extraction"):
             response = TestClient(app).post(
                 "/api/chat/message",
                 json={
@@ -73,7 +76,7 @@ def test_chat_injects_saved_nutrition_profile(db):
         with patch(
             "app.api.chat.run_agent",
             new=AsyncMock(return_value={"response": "已结合目标", "tool_calls": [], "analysis_result": None}),
-        ) as mocked:
+        ) as mocked, patch("app.api.chat._schedule_graph_extraction"):
             response = TestClient(app).post("/api/chat/message", json={"message": "晚饭怎么吃？"})
     finally:
         app.dependency_overrides.clear()
@@ -146,7 +149,7 @@ def test_chat_generates_session_id():
         with patch(
             "app.api.chat.run_agent",
             new=AsyncMock(return_value={"response": "你好", "tool_calls": [], "analysis_result": None}),
-        ):
+        ), patch("app.api.chat._schedule_graph_extraction"):
             response = TestClient(app).post(
                 "/api/chat/message",
                 json={"message": "你好"},
@@ -164,7 +167,8 @@ def test_mock_yolo_endpoint_passes_detections_without_auth():
         "tool_calls": [{"name": "calculate_total_nutrition", "args": {}}],
         "analysis_result": None,
     }
-    with patch("app.api.chat.run_agent", new=AsyncMock(return_value=agent_result)) as mocked:
+    with patch("app.api.chat.run_agent", new=AsyncMock(return_value=agent_result)) as mocked, \
+            patch("app.api.chat._schedule_graph_extraction"):
         response = TestClient(app).post(
             "/api/chat/mock-yolo",
             json={
@@ -454,13 +458,16 @@ def test_conversation_extraction_uses_combined_text():
     async def _scenario():
         captured = {}
 
-        async def _fake_extract(text, source=""):
+        async def _fake_extract(text, source="", user_id=0):
             captured["text"] = text
             captured["source"] = source
+            captured["user_id"] = user_id
             return 2
 
         with patch.object(chat_api.knowledge_service, "extract_and_store_graph", new=_fake_extract):
-            chat_api._schedule_graph_extraction("我今天吃了鸡胸肉", "鸡胸肉每100g蛋白质31g，很适合减脂。")
+            chat_api._schedule_graph_extraction(
+                "我今天吃了鸡胸肉", "鸡胸肉每100g蛋白质31g，很适合减脂。", user_id=42,
+            )
             # 让后台任务跑完
             await asyncio.sleep(0)
             while chat_api._graph_tasks:
@@ -471,6 +478,7 @@ def test_conversation_extraction_uses_combined_text():
     assert "鸡胸肉" in captured["text"]
     assert "蛋白质31g" in captured["text"]
     assert captured["source"] == "对话抽取"
+    assert captured["user_id"] == 42
 
 
 def test_conversation_extraction_skips_empty_text():
@@ -501,9 +509,109 @@ def _parse_sse(body: str) -> list[dict]:
     return events
 
 
-def test_message_stream_endpoint_emits_sse_events():
-    app.dependency_overrides[get_current_user] = _mock_user
+def test_stream_persists_reply_before_done_and_schedules_user_scoped_graph(db):
+    """done 到达前用户/助手消息已落库；图谱抽取以当前用户身份后台调度。"""
+    import app.api.chat as chat_api
 
+    user = User(
+        id=703, username="stream-persist-user", email="stream-persist@example.com",
+        hashed_password="hash", is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    session_factory = sessionmaker(bind=db.get_bind())
+
+    async def _fake_stream(*_args, **_kwargs):
+        yield {"type": "token", "text": "鸡胸肉富含蛋白质。"}
+        yield {
+            "type": "done",
+            "response": "鸡胸肉富含蛋白质。",
+            "tool_calls": [],
+            "detections": [],
+            "detection_mode": None,
+        }
+
+    captured = {}
+
+    async def _fake_extract(question, response, user_id=None):
+        captured["user_id"] = user_id
+        captured["text"] = f"{question}\n\n{response}"
+        return 1
+
+    async def _collect():
+        frames = [frame async for frame in chat_api._stream_chat_events(
+            session_id="stream-persist-001",
+            message="鸡胸肉有什么营养？",
+            thread_prefix="user:703",
+            user_id=user.id,
+        )]
+        # 抽取是后台 fire-and-forget，等它跑完再断言
+        while chat_api._graph_tasks:
+            await asyncio.gather(*list(chat_api._graph_tasks))
+        return frames
+
+    with patch.object(chat_api, "get_session_local", return_value=session_factory), \
+            patch.object(chat_api, "stream_agent", new=_fake_stream), \
+            patch.object(chat_api, "_extract_conversation_graph", new=_fake_extract):
+        events = _parse_sse("".join(asyncio.run(_collect())))
+
+    db.expire_all()
+    messages = db.query(ChatMessage).order_by(ChatMessage.id).all()
+    assert [(item.role, item.content) for item in messages] == [
+        ("user", "鸡胸肉有什么营养？"),
+        ("assistant", "鸡胸肉富含蛋白质。"),
+    ]
+    # done 立即下发，不再阻塞在图谱抽取上
+    done = next(event for event in events if event["type"] == "done")
+    assert done["response"] == "鸡胸肉富含蛋白质。"
+    # 图谱抽取按当前用户隔离调度
+    assert captured["user_id"] == 703
+    assert "鸡胸肉" in captured["text"]
+
+
+def test_stream_error_still_persists_assistant_record(db):
+    """Agent 返回 error 时，历史记录不能只剩一条用户消息。"""
+    import app.api.chat as chat_api
+
+    user = User(
+        id=704, username="stream-error-user", email="stream-error@example.com",
+        hashed_password="hash", is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    session_factory = sessionmaker(bind=db.get_bind())
+
+    async def _fake_stream(*_args, **_kwargs):
+        yield {"type": "error", "message": "模型暂时不可用"}
+
+    async def _collect():
+        return [frame async for frame in chat_api._stream_chat_events(
+            session_id="stream-error-001",
+            message="帮我分析晚餐",
+            thread_prefix="user:704",
+            user_id=user.id,
+        )]
+
+    with patch.object(chat_api, "get_session_local", return_value=session_factory), \
+            patch.object(chat_api, "stream_agent", new=_fake_stream):
+        asyncio.run(_collect())
+
+    db.expire_all()
+    messages = db.query(ChatMessage).order_by(ChatMessage.id).all()
+    assert [item.role for item in messages] == ["user", "assistant"]
+    assert "模型暂时不可用" in messages[1].content
+
+
+def test_message_stream_endpoint_emits_sse_events(db):
+    import app.api.chat as chat_api
+
+    user = db.get(User, 7)
+    if user is None:
+        user = _mock_user()
+        user.hashed_password = "hash"
+        db.add(user)
+        db.commit()
+    session_factory = sessionmaker(bind=db.get_bind())
     async def _fake_stream(*_args, **_kwargs):
         yield {"type": "token", "text": "你好"}
         yield {"type": "tool", "name": "query_food_calories"}
@@ -513,17 +621,22 @@ def test_message_stream_endpoint_emits_sse_events():
                "tool_calls": [{"name": "query_food_calories", "args": {}}],
                "detections": [], "detection_mode": None}
 
-    try:
-        with patch("app.api.chat.stream_agent", new=_fake_stream):
-            with TestClient(app).stream(
-                "POST", "/api/chat/message/stream",
-                json={"session_id": "meal-1", "message": "分析一下"},
-            ) as response:
-                assert response.status_code == 200
-                assert response.headers["content-type"].startswith("text/event-stream")
-                body = "".join(response.iter_text())
-    finally:
-        app.dependency_overrides.clear()
+    async def _request_body():
+        response = await chat_api.send_message_stream(
+            ChatRequest(session_id="meal-1", message="分析一下"),
+            current_user=user,
+        )
+        parts = []
+        async for chunk in response.body_iterator:
+            parts.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+        return "".join(parts)
+
+    with patch("app.api.chat.get_session_local", return_value=session_factory), patch(
+        "app.api.chat.stream_agent", new=_fake_stream,
+    ), patch(
+        "app.api.chat._extract_conversation_graph", new=AsyncMock(return_value=0),
+    ):
+        body = asyncio.run(_request_body())
 
     events = _parse_sse(body)
     types = [event["type"] for event in events]
@@ -532,6 +645,75 @@ def test_message_stream_endpoint_emits_sse_events():
     done = next(event for event in events if event["type"] == "done")
     assert done["response"] == "这餐约 250 kcal。"
     assert done["tool_calls"][0]["name"] == "query_food_calories"
+
+
+def test_recovers_xml_tool_call_leaked_as_text():
+    """模型把工具调用当文本吐出（<function=...> 形式）时应能恢复成真正的 tool_calls。"""
+    leaked = (
+        "<tool_call>\n<function=query_food_calories>\n"
+        "<parameter=food_name>\n薯条\n</parameter>\n</function>\n</tool_call>"
+    )
+    recovered = agent_graph._recover_tool_calls_from_text(leaked)
+    assert len(recovered) == 1
+    assert recovered[0]["name"] == "query_food_calories"
+    assert recovered[0]["args"]["food_name"] == "薯条"
+    # 清洗后不应再残留任何标签文本
+    assert agent_graph._strip_leaked_tool_calls(leaked) == ""
+
+
+def test_recovers_hermes_json_tool_call_leaked_as_text():
+    """Hermes JSON 体的文本工具调用也应能恢复。"""
+    leaked = '<tool_call>{"name": "query_food_calories", "arguments": {"food_name": "apple"}}</tool_call>'
+    recovered = agent_graph._recover_tool_calls_from_text(leaked)
+    assert recovered[0]["name"] == "query_food_calories"
+    assert recovered[0]["args"]["food_name"] == "apple"
+
+
+def test_agent_node_recovers_leaked_tool_call_into_real_tool_calls():
+    """agent_node 收到「文本工具调用」时应转成真正的 tool_calls，让图能路由到工具节点。"""
+    class _LeakingModel:
+        def bind_tools(self, _tools):
+            return self
+
+        async def ainvoke(self, _messages):
+            return AIMessage(content=(
+                "<tool_call><function=query_food_calories>"
+                "<parameter=food_name>薯条</parameter></function></tool_call>"
+            ))
+
+    state = {"messages": [HumanMessage(content="薯条的热量是多少？")]}
+    with patch("app.services.agent_graph._get_base_llm", return_value=_LeakingModel()):
+        result = asyncio.run(agent_graph.agent_node(state))
+
+    message = result["messages"][0]
+    assert message.tool_calls
+    assert message.tool_calls[0]["name"] == "query_food_calories"
+    assert message.tool_calls[0]["args"]["food_name"] == "薯条"
+
+
+def test_final_answer_node_strips_leaked_tool_call_and_returns_prose():
+    """收尾节点必须清洗泄漏的工具调用文本，绝不把 XML 当回答返回给用户。"""
+    class _LeakThenAnswerModel:
+        def __init__(self):
+            self.calls = 0
+
+        async def ainvoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content=(
+                    "<tool_call><function=query_food_calories>"
+                    "<parameter=food_name>薯条</parameter></function></tool_call>"
+                ))
+            return AIMessage(content="薯条属于高油煎炸食品，减脂期建议控制份量。")
+
+    model = _LeakThenAnswerModel()
+    state = {"messages": [HumanMessage(content="薯条有利于减肥吗？")]}
+    with patch("app.services.agent_graph._get_final_llm", return_value=model):
+        result = asyncio.run(agent_graph.final_answer_node(state))
+
+    content = result["messages"][0].content
+    assert "<tool_call>" not in content and "<function" not in content
+    assert "薯条" in content
 
 
 def test_stream_agent_maps_events_and_appends_web_sources():

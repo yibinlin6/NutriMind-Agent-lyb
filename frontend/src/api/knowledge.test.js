@@ -5,7 +5,7 @@ vi.mock('@/utils/request', () => ({
 }))
 
 import request from '@/utils/request'
-import { askKnowledgeApi, searchKnowledgeApi } from './knowledge'
+import { askKnowledgeApi, searchKnowledgeApi, uploadDocumentApi } from './knowledge'
 
 describe('knowledge api', () => {
   beforeEach(() => {
@@ -37,5 +37,14 @@ describe('knowledge api', () => {
     const params = { query: '膳食纤维', k: 3 }
     searchKnowledgeApi(params)
     expect(request.get).toHaveBeenCalledWith('/knowledge/search', { params })
+  })
+
+  it('uploads documents with a long timeout so image parsing does not time out', () => {
+    const file = new File(['data'], 'meal.png', { type: 'image/png' })
+    uploadDocumentApi(file)
+    const [url, form, config] = request.post.mock.calls[0]
+    expect(url).toBe('/knowledge/upload')
+    expect(form).toBeInstanceOf(FormData)
+    expect(config.timeout).toBe(300000)
   })
 })

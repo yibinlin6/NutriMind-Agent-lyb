@@ -342,14 +342,19 @@ async def query_food_calories(food_name: str) -> str:
         格式化的营养信息文本，如果未找到则返回提示信息。
     """
     def _query_sync(food_name: str) -> str:
+        uid = agent_user_id.get()
         db = SessionLocal()
         try:
+            # 只查当前用户的营养库（按用户隔离）；查不到再回退内置/联网。
+            # 排除待补全（无热量）条目，避免 None 参与格式化/计算。
             # 模糊查询：先精确匹配，再模糊匹配
             food = (
                 db.query(FoodNutrition)
                 .filter(
+                    FoodNutrition.user_id == uid,
+                    FoodNutrition.calories_per_100g.isnot(None),
                     (FoodNutrition.food_name == food_name.lower())
-                    | (FoodNutrition.food_name_cn == food_name)
+                    | (FoodNutrition.food_name_cn == food_name),
                 )
                 .first()
             )
@@ -359,8 +364,10 @@ async def query_food_calories(food_name: str) -> str:
                 food = (
                     db.query(FoodNutrition)
                     .filter(
+                        FoodNutrition.user_id == uid,
+                        FoodNutrition.calories_per_100g.isnot(None),
                         FoodNutrition.food_name.ilike(f"%{food_name}%")
-                        | FoodNutrition.food_name_cn.ilike(f"%{food_name}%")
+                        | FoodNutrition.food_name_cn.ilike(f"%{food_name}%"),
                     )
                     .first()
                 )
@@ -410,11 +417,16 @@ async def query_food_by_category(category: str) -> str:
         格式化的食物列表文本
     """
     def _query_sync(category: str) -> str:
+        uid = agent_user_id.get()
         db = SessionLocal()
         try:
             foods = (
                 db.query(FoodNutrition)
-                .filter(FoodNutrition.category == category.lower())
+                .filter(
+                    FoodNutrition.user_id == uid,
+                    FoodNutrition.calories_per_100g.isnot(None),
+                    FoodNutrition.category == category.lower(),
+                )
                 .order_by(FoodNutrition.calories_per_100g)
                 .all()
             )
@@ -423,7 +435,11 @@ async def query_food_by_category(category: str) -> str:
                 # 模糊匹配
                 foods = (
                     db.query(FoodNutrition)
-                    .filter(FoodNutrition.category.ilike(f"%{category}%"))
+                    .filter(
+                        FoodNutrition.user_id == uid,
+                        FoodNutrition.calories_per_100g.isnot(None),
+                        FoodNutrition.category.ilike(f"%{category}%"),
+                    )
                     .order_by(FoodNutrition.calories_per_100g)
                     .all()
                 )
@@ -468,6 +484,7 @@ async def calculate_total_nutrition(food_items_json: str) -> str:
         if not items:
             return "食物清单为空，无法计算。"
 
+        uid = agent_user_id.get()
         db = SessionLocal()
         database_available = True
         try:
@@ -491,8 +508,10 @@ async def calculate_total_nutrition(food_items_json: str) -> str:
                         food = (
                             db.query(FoodNutrition)
                             .filter(
+                                FoodNutrition.user_id == uid,
+                                FoodNutrition.calories_per_100g.isnot(None),
                                 (FoodNutrition.food_name == food_name.lower())
-                                | (FoodNutrition.food_name_cn == food_name)
+                                | (FoodNutrition.food_name_cn == food_name),
                             )
                             .first()
                         )
